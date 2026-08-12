@@ -20,6 +20,8 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "tcg/helper-tcg.h"
+#include "hw/qdev-core.h"
+#include "qapi/error.h"
 
 #include "system/system.h"
 #include "qemu/units.h"
@@ -27,6 +29,12 @@
 #include "system/memory.h"
 
 #include "tcg/tcg-cpu.h"
+
+/*
+ * Per-CPU RAM window base (low-4G hole on q35/pc); one 4 KiB page
+ * per vCPU, selected by cpu_index.
+ */
+#define NTO64_PERCPU_RAM_BASE 0xDF000000u
 
 static void tcg_cpu_machine_done(Notifier *n, void *unused)
 {
@@ -72,6 +80,35 @@ bool tcg_cpu_realizefn(CPUState *cs, Error **errp)
                              get_system_memory(), 0, ~0ull);
     memory_region_add_subregion_overlap(cpu->cpu_as_root, 0, cpu->cpu_as_mem, 0);
     memory_region_set_enabled(cpu->cpu_as_mem, true);
+
+    /*
+     * nto64-per-cpu-ram: give this vCPU its own address space whose
+     * root is the full system memory plus a private per-CPU RAM page.
+     * The per-CPU views union into the same real RAM; each CPU only
+     * sees its own private window (testbed for per-CPU memory).
+     */
+    if (object_property_get_bool(OBJECT(qdev_get_machine()),
+                                 "nto64-per-cpu-ram", NULL)) {
+        MemoryRegion *cpu_ram_root = g_new(MemoryRegion, 1);
+        MemoryRegion *cpu_ram_sysmem = g_new(MemoryRegion, 1);
+        MemoryRegion *cpu_ram_priv = g_new(MemoryRegion, 1);
+        char *priv_name = g_strdup_printf("cpu-ram-private-%d",
+                                          cs->cpu_index);
+
+        memory_region_init(cpu_ram_root, OBJECT(cpu), "cpu-ram", ~0ull);
+        memory_region_init_alias(cpu_ram_sysmem, OBJECT(cpu),
+                                 "cpu-ram-sysmem", get_system_memory(),
+                                 0, ~0ull);
+        memory_region_add_subregion(cpu_ram_root, 0, cpu_ram_sysmem);
+        memory_region_init_ram(cpu_ram_priv, OBJECT(cpu),
+                               priv_name, 0x1000, &error_abort);
+        g_free(priv_name);
+        memory_region_add_subregion_overlap(
+            cpu_ram_root,
+            NTO64_PERCPU_RAM_BASE + cs->cpu_index * 0x1000,
+            cpu_ram_priv, 1);
+        cs->memory = cpu_ram_root;
+    }
 
     cs->num_ases = 2;
     cpu_address_space_init(cs, X86ASIdx_MEM, "cpu-memory", cs->memory);

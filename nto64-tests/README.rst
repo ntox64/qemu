@@ -54,3 +54,26 @@ through OVMF.
 Run targets are grouped per subsystem under ``rules/``, one makefile per
 section below.  ``clean`` and ``.PHONY`` derive from the sources, so
 adding a test does not mean editing a list.
+
+
+Memory and CPU locality
+-----------------------
+
+The unit here is the node rather than the CPU: a CPU can only be close to
+memory if some memory is somebody's local memory first.
+
+Per-CPU RAM views
+~~~~~~~~~~~~~~~~~
+
+``-machine nto64-per-cpu-ram=on`` gives every vCPU its own address space
+root: an alias of the whole system memory plus a private 4 KiB page per
+CPU in the window at ``nto64-per-cpu-ram-base`` (default ``0xDF000000``).
+A test can then distinguish an access to its own page from an access into
+another CPU's page, on the CPU side rather than only for a device.
+
+Run ``make run-percputest``.
+
+.. note::
+   The private pages are plain RAM at this point and carry no latency or
+   coherency model; the shared system-memory alias, firmware and low
+   memory are untouched, so a PC guest still boots normally.

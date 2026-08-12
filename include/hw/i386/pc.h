@@ -49,6 +49,7 @@ typedef struct PCMachineState {
     bool sata_enabled;
     bool hpet_enabled;
     bool i8042_enabled;
+    bool nto64_per_cpu_ram;
     bool default_bus_bypass_iommu;
     bool fd_bootchk;
     uint64_t max_fw_size;

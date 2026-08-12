@@ -1545,6 +1545,21 @@ static void pc_machine_set_hpet(Object *obj, bool value, Error **errp)
     pcms->hpet_enabled = value;
 }
 
+static bool pc_machine_get_nto64_per_cpu_ram(Object *obj, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    return pcms->nto64_per_cpu_ram;
+}
+
+static void pc_machine_set_nto64_per_cpu_ram(Object *obj, bool value,
+                                             Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    pcms->nto64_per_cpu_ram = value;
+}
+
 static bool pc_machine_get_i8042(Object *obj, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
@@ -1795,6 +1810,13 @@ static void pc_machine_class_init(ObjectClass *oc, const void *data)
         pc_machine_get_hpet, pc_machine_set_hpet);
     object_class_property_set_description(oc, "hpet",
         "Enable/disable high precision event timer emulation");
+
+    object_class_property_add_bool(oc, "nto64-per-cpu-ram",
+        pc_machine_get_nto64_per_cpu_ram,
+        pc_machine_set_nto64_per_cpu_ram);
+    object_class_property_set_description(oc, "nto64-per-cpu-ram",
+        "Give every vCPU its own address-space view with a private "
+        "per-CPU RAM window (testbed for per-CPU memory)");
 
     object_class_property_add_bool(oc, PC_MACHINE_I8042,
         pc_machine_get_i8042, pc_machine_set_i8042);
