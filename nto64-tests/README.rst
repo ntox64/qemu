@@ -277,3 +277,47 @@ against the device's per-vector counters.
    TCG, same-vector edge messages fired rapidly coalesce in the IRR, as
    edge-triggered semantics require, so a case asserts a minimum
    delivery count and proves completion by data.
+
+
+DMA
+---
+
+Node binding, address translation, peer targets and faulting all change
+what one engine sees, so they are one device with orthogonal controls
+rather than several devices.
+
+Node-bound DMA engine
+~~~~~~~~~~~~~~~~~~~~~
+
+``nto64-dma`` (PCI ``1234:1ee9``) roots its DMA address space at the
+``node`` vCPU's view, so device DMA follows the same per-CPU shape as a
+CPU access: the node's own window page is direct RAM, a foreign page
+traverses the interconnect, plain RAM is the normal system alias.  Its
+completion is an MSI-X vector the guest targets at that node's CPU.
+``max-xfer`` reaches 1 GiB and ``queues`` (default 4) binds queue *i* to
+vCPU *i* with completion vector *i*.
+
+.. code-block:: text
+
+  BAR0  0x00  magic
+        0x04  control: bit0 start, bit1 irq-on-done, bit2 ring mode
+        0x08/0x10/0x18  source, destination, size
+        0x1c  status;  0x20/0x24  transfers, bytes
+        0x28-0x38  legacy ring (base, count, stride, done) - aliases queue 0
+        0x3c-0x50  queue count, select, ring base/count/stride, start
+        0x58-0x64  per-queue done, transfers, bytes
+
+Descriptor ring entries are source, destination, length and flags (bit0
+valid, bit1 completed by the device, bit2 peer destination, bit3 peer
+source).  Bulk transfers are chunked and both modes run from a bottom
+half.  Run ``make run-msixtest`` for the completion and locality checks.
+
+.. note::
+   Doing the copy inside the MMIO write handler would hold the BQL and
+   re-enter other regions mid-handler, so transfers are always
+   asynchronous - and ordering between two queues is then QEMU's
+   scheduling, not a hardware queue's.  Errors are never reported as
+   success: starting while busy latches an error status and a ring whose
+   last entry is not valid completes with an error, because a test device
+   that quietly succeeds hides precisely the driver bugs this tree exists
+   to find.

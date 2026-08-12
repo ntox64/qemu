@@ -18,6 +18,15 @@
  *    to a nonexistent APIC (7) and verifies nobody receives it;
  *    restores it and fires all four at once (burst), verifying all
  *    CPUs get theirs.
+ *  DMA (single engine): node-bound bulk + descriptor-ring transfers
+ *    with completion MSI-X vector 0 -> CPU0 (vector 0x70).
+ *  multi-queue: nto64-dma with queues=4, queue i bound
+ *    vCPU i (ring + DMA run through vCPU i's memory view), completion
+ *    MSI-X vector i -> CPU i (vector 0x80+i).  Each queue copies
+ *    4 x 64 bytes from its own window page (direct) to the next
+ *    node's page +0x200 (cross-node via the interconnect, counted),
+ *    verifying per-queue ring completion, per-CPU receipt, direct
+ *    local reads (rd delta 0) and counted cross-node writes.
  *
  * Build: `make msixtest`, run: `make run-msixtest`.
  */
@@ -40,7 +49,7 @@ _start:
     movl 12(%edx), %eax
     cmpl $\cnt, %eax
     je 92f
-91: movl $1, fail(%rip)
+91: incl fail(%rip)
 92:
 .endm
 
@@ -49,7 +58,7 @@ _start:
     movl 16(%edx), %eax
     cmpl $\cnt, %eax
     je 93f
-    movl $1, fail(%rip)
+    incl fail(%rip)
 93:
 .endm
 
@@ -58,7 +67,7 @@ _start:
     movl 4(%edx), %eax
     cmpl $\id, %eax
     je 94f
-    movl $1, fail(%rip)
+    incl fail(%rip)
 94:
 .endm
 
@@ -118,10 +127,10 @@ msix_found:
 scan_done:
     cmpl $0, irqgen_dev(%rip)
     jne 1f
-    movl $1, fail(%rip)
+    incl fail(%rip)
 1:  cmpl $0, msix_dev(%rip)
     jne 2f
-    movl $1, fail(%rip)
+    incl fail(%rip)
 2:
 
     /* --- enable memory space, read BARs ---- */
@@ -217,7 +226,7 @@ ap_loop:
     shll $5, %eax
     addl $0x9100, %eax
     movl %eax, %r13d          /* AP slot */
-    movl $200000000, %ecx
+    movl $30000000, %ecx
 ap_wait:
     cmpl $0, 0(%r13d)
     jne ap_done
@@ -226,11 +235,11 @@ ap_wait:
 ap_done:
     cmpl $0, 0(%r13d)
     jne 1f
-    movl $1, fail(%rip)
+    incl fail(%rip)
 1:  movl 4(%r13d), %eax
     cmpl %r12d, %eax
     je 2f
-    movl $1, fail(%rip)
+    incl fail(%rip)
 2:  incl %r12d
     cmpl $4, %r12d
     jb ap_loop
@@ -242,7 +251,7 @@ ap_done:
     movl %ecx, %r15d          /* MSI cap offset */
     testl %ecx, %ecx
     jnz 1f
-    movl $1, fail(%rip)
+    incl fail(%rip)
 1:
     /* message address low = 0xfee01000 (dest APIC 1) */
     movl irqgen_dev(%rip), %edi
@@ -295,7 +304,7 @@ ap_done:
     movl %ecx, %r15d          /* MSI-X cap offset */
     testl %ecx, %ecx
     jnz 1f
-    movl $1, fail(%rip)
+    incl fail(%rip)
 1:
     /* table = bar1 + (table offset & ~7) */
     movl msix_dev(%rip), %edi
@@ -388,7 +397,7 @@ ap_done:
     subl pv3_0(%rip), %eax
     cmpl $1, %eax
     je 2f
-1:  movl $1, fail(%rip)
+1:  incl fail(%rip)
 2:  /* guest-side: no CPU recorded anything (counts unchanged) */
     chk_msix 0x9100, 1, 1
     chk_msix 0x9120, 2, 1
@@ -427,6 +436,418 @@ ap_done:
     movl 0x24(%esi), %eax
     movl %eax, pv3(%rip)
 
+    /* --- DMA: nto64-dma bound to node 0 ----
+     * local DMA within node0's window page (direct RAM), then
+     * cross-node DMA into node1's page (interconnect in ccNUMA
+     * mode); completion MSI-X vector 0 -> CPU0 (vector 0x70). */
+    xorl %edi, %edi
+dma_scan:
+    xorl %ecx, %ecx
+    call cfgread32
+    cmpl $0xffffffff, %eax
+    je dma_next
+    cmpl $0x1ee91234, %eax
+    je dma_found
+dma_next:
+    incl %edi
+    cmpl $32, %edi
+    jb dma_scan
+    jmp dma_scan_done
+dma_found:
+    movl %edi, dma_dev(%rip)
+dma_scan_done:
+    cmpl $0, dma_dev(%rip)
+    jne 1f
+    incl fail(%rip)
+1:  /* enable memory, read BARs */
+    movl dma_dev(%rip), %edi
+    movl $4, %ecx
+    call cfgread32
+    orl $2, %eax
+    movl %eax, %r8d
+    movl dma_dev(%rip), %edi
+    movl $4, %ecx
+    call cfgwrite32
+    movl dma_dev(%rip), %edi
+    movl $0x10, %ecx
+    call cfgread32
+    andl $0xfffffff0, %eax
+    movl %eax, dma_bar0(%rip)
+    movl dma_dev(%rip), %edi
+    movl $0x14, %ecx
+    call cfgread32
+    andl $0xfffffff0, %eax
+    movl %eax, dma_bar1(%rip)
+    /* MSI-X: vector 0 -> dest 0 (CPU0), vector number 0x70 */
+    movl dma_dev(%rip), %edi
+    movl $0x11, %edx
+    call findcap
+    movl %ecx, %r15d
+    testl %ecx, %ecx
+    jnz 1f
+    incl fail(%rip)
+1:  movl dma_dev(%rip), %edi
+    leal 4(%r15d), %ecx
+    call cfgread32
+    andl $0xfffffff8, %eax
+    addl dma_bar1(%rip), %eax
+    movl %eax, %r14d          /* table base */
+    movl $0xfee00000, 0(%r14d)
+    movl $0, 4(%r14d)
+    movl $0x70, 8(%r14d)
+    movl $0, 12(%r14d)
+    movl dma_dev(%rip), %edi
+    leal 2(%r15d), %ecx
+    call cfgread32
+    orl $0x80000000, %eax
+    movl %eax, %r8d
+    movl dma_dev(%rip), %edi
+    leal 2(%r15d), %ecx
+    call cfgwrite32
+    movl dma_dev(%rip), %edi
+    leal 12(%r15d), %ecx
+    movl $0, %r8d
+    call cfgwrite32
+    /* interconnect in ccNUMA (coherent) mode */
+    movl $0xdf100000, %ebp
+    movl $0x10, 0x0c(%ebp)
+    /* fill node0's page source region with a pattern */
+    movl $0xdf000000, %edi
+    movl $0xa5a5a5a5, %eax
+    movl $256, %ecx
+2:  movl %eax, (%edi)
+    addl $4, %edi
+    decl %ecx
+    jnz 2b
+    /* local DMA: 0xdf000000 -> 0xdf000800, 1 KiB (same page) */
+    movl dma_bar0(%rip), %esi
+    movl 0x10(%ebp), %eax
+    movl %eax, rd0(%rip)
+    movl 0x14(%ebp), %eax
+    movl %eax, wr0(%rip)
+    movl $0xdf000000, 0x08(%esi)
+    movl $0, 0x0c(%esi)
+    movl $0xdf000800, 0x10(%esi)
+    movl $0, 0x14(%esi)
+    movl $0x400, 0x18(%esi)
+    movl $3, 0x04(%esi)      /* start + irq on done */
+    movl $30000000, %ecx
+3:  movl 0x1c(%esi), %eax
+    testl $2, %eax
+    jnz 4f
+    decl %ecx
+    jnz 3b
+4:  movl $0xdf000800, %edi
+    movl (%edi), %eax
+    cmpl $0xa5a5a5a5, %eax
+    je 5f
+    incl fail(%rip)
+5:  /* local DMA must not traverse the interconnect */
+    movl 0x10(%ebp), %eax
+    subl rd0(%rip), %eax
+    jz 6f
+    incl fail(%rip)
+6:  movl 0x14(%ebp), %eax
+    subl wr0(%rip), %eax
+    jz 7f
+    incl fail(%rip)
+7:  /* cross-node DMA: 0xdf000000 -> 0xdf001000 (node1's page) */
+    movl 0x10(%ebp), %eax
+    movl %eax, rd1(%rip)
+    movl 0x14(%ebp), %eax
+    movl %eax, wr1(%rip)
+    movl $0x9100, %edx
+    movl 20(%edx), %eax
+    movl %eax, dma_before(%rip)
+    movl $0xdf001000, 0x10(%esi)
+    movl $3, 0x04(%esi)
+    movl $30000000, %ecx
+8:  movl 0x1c(%esi), %eax
+    testl $2, %eax
+    jz 9f
+    movl $0x9100, %edx
+    movl 20(%edx), %eax
+    cmpl dma_before(%rip), %eax
+    jg 10f
+9:  decl %ecx
+    jnz 8b
+10: /* cross-node copy must be coherent (ccNUMA) and counted */
+    movl $0xdf001000, %edi
+    movl (%edi), %eax
+    cmpl $0xa5a5a5a5, %eax
+    je 11f
+    incl fail(%rip)
+11: movl 0x10(%ebp), %eax
+    subl rd1(%rip), %eax
+    movl %eax, rd_delta(%rip)
+    jnz 12f
+    incl fail(%rip)
+12: movl 0x14(%ebp), %eax
+    subl wr1(%rip), %eax
+    movl %eax, wr_delta(%rip)
+    jnz 13f
+    incl fail(%rip)
+13: movl $0x9100, %edx
+    movl 20(%edx), %eax
+    movl %eax, bsp_dma(%rip)
+    /* large GPU-like DMA: 32 MiB between plain-RAM buffers
+     * (0x01000000 -> 0x10000000, safe from the app image),
+     * fill the whole source with a pattern, verify the copy at
+     * 1 MiB intervals */
+    movl $0x01000000, %edi
+    movl $0xa5a5a5a5, %eax
+    movl $0x800000, %ecx
+    rep stosl
+    movl dma_bar0(%rip), %esi
+    movl $0x01000000, 0x08(%esi)
+    movl $0, 0x0c(%esi)
+    movl $0x10000000, 0x10(%esi)
+    movl $0, 0x14(%esi)
+    movl $0x02000000, 0x18(%esi)
+    movl $3, 0x04(%esi)      /* start + irq on done */
+    movl $30000000, %ecx
+14: movl 0x1c(%esi), %eax
+    testl $2, %eax
+    jnz 15f
+    decl %ecx
+    jnz 14b
+15: movl $0x10000000, %edi
+    movl $32, %ebx
+samp:
+    movl (%edi), %eax
+    cmpl $0xa5a5a5a5, %eax
+    je 1f
+    incl fail(%rip)
+1:  addl $0x100000, %edi
+    decl %ebx
+    jnz samp
+17: movl $0x9100, %edx
+    movl 20(%edx), %eax
+    movl %eax, bsp_dma(%rip)
+    /* descriptor-ring DMA (NIC/RDMA-like): 64 x 64-byte messages,
+     * one completion MSI-X per message.  Pattern at 0x07001000,
+     * descriptors at 0x07000000, destinations 0x07002000 + i*64. */
+    movl $0x07001000, %edi
+    movl $0xc3c3c3c3, %eax
+    movl $16, %ecx
+fillp:
+    movl %eax, (%edi)
+    addl $4, %edi
+    decl %ecx
+    jnz fillp
+    movl $0x07000000, %edi
+    xorl %ebx, %ebx
+desc:
+    movl $0x07001000, 0(%edi)      /* src */
+    movl %ebx, %eax
+    shll $6, %eax
+    addl $0x07002000, %eax
+    movl %eax, 4(%edi)             /* dst = 0x07002000 + i*64 */
+    movl $64, 8(%edi)              /* len */
+    movl $1, 12(%edi)              /* valid */
+    addl $16, %edi
+    incl %ebx
+    cmpl $64, %ebx
+    jb desc
+    movl dma_bar0(%rip), %esi
+    movl $0x07000000, 0x28(%esi)
+    movl $0, 0x2c(%esi)
+    movl $64, 0x30(%esi)
+    movl $16, 0x34(%esi)
+    movl $7, 0x04(%esi)            /* start + irq + ring mode */
+    movl $30000000, %ecx
+ring_wait:
+    movl 0x1c(%esi), %eax
+    testl $2, %eax
+    jnz ring_done
+    decl %ecx
+    jnz ring_wait
+ring_done:
+    movl 0x38(%esi), %eax
+    movl %eax, ring_done_cnt(%rip)
+    cmpl $64, %eax
+    je 18f
+    incl fail(%rip)
+18: movl $0x07002000, %edi
+    movl $64, %ebx
+rchk:
+    movl (%edi), %eax
+    cmpl $0xc3c3c3c3, %eax
+    je 1f
+    incl fail(%rip)
+1:  addl $64, %edi
+    decl %ebx
+    jnz rchk
+20: movl $0x9100, %edx
+    movl 20(%edx), %eax
+    movl %eax, bsp_dma(%rip)
+
+    /* ---: per-queue DMA + per-vector MSI-X locality ----
+     * Program the DMA MSI-X table so vector i -> APIC i with vector
+     * number 0x80+i (completion for queue i lands on CPU i).  Queue i
+     * is bound to vCPU i.  Each queue copies 4 x 64 bytes from its
+     * own window page (direct in its view) to the next node's page
+     * +0x200 (cross-node via the interconnect, counted), one
+     * completion MSI-X per message. */
+    movl %r14d, dma_tab(%rip)
+    movl $0xdf100000, %ebp
+    xorl %ebx, %ebx
+pq_tab:
+    movl %ebx, %eax
+    shll $12, %eax
+    addl $0xfee00000, %eax
+    movl %ebx, %ecx
+    shll $4, %ecx
+    addl dma_tab(%rip), %ecx
+    movl %eax, 0(%ecx)        /* addr low: dest = i */
+    movl $0, 4(%ecx)          /* addr high */
+    movl %ebx, %eax
+    addl $0x80, %eax
+    movl %eax, 8(%ecx)        /* data: vector 0x80+i */
+    movl $0, 12(%ecx)         /* unmasked */
+    incl %ebx
+    cmpl $4, %ebx
+    jb pq_tab
+
+    movl dma_bar0(%rip), %esi
+    xorl %r15d, %r15d         /* queue index */
+pq_loop:
+    /* pattern p_i = 0x11111111 * (i+1), 64 bytes at own window page */
+    movl %r15d, %eax
+    incl %eax
+    imull $0x11111111, %eax, %eax
+    movl %eax, pq_pat(%rip)
+    movl %r15d, %eax
+    shll $12, %eax
+    addl $0xdf000000, %eax
+    movl %eax, %r13d          /* own page */
+    movl pq_pat(%rip), %eax
+    movl %r13d, %edi
+    movl $16, %ecx
+1:  movl %eax, (%edi)
+    addl $4, %edi
+    decl %ecx
+    jnz 1b
+    /* ring of 4 descriptors at 0x07008000 + i*0x40 */
+    movl %r15d, %eax
+    shll $6, %eax
+    addl $0x07008000, %eax
+    movl %eax, %r12d          /* ring base */
+    movl %r12d, %edi
+    xorl %ebx, %ebx
+pq_desc:
+    movl %r13d, %eax
+    movl %ebx, %ecx
+    shll $6, %ecx
+    addl %ecx, %eax
+    movl %eax, 0(%edi)        /* src = own + k*64 */
+    movl %r15d, %eax
+    addl $1, %eax
+    andl $3, %eax
+    shll $12, %eax
+    addl $0xdf000000, %eax    /* next page base */
+    addl $0x200, %eax         /* + 0x200 */
+    movl %ebx, %ecx
+    shll $6, %ecx
+    addl %ecx, %eax
+    movl %eax, 4(%edi)        /* dst = next page + 0x200 + k*64 */
+    movl $64, 8(%edi)
+    movl $1, 12(%edi)
+    addl $16, %edi
+    incl %ebx
+    cmpl $4, %ebx
+    jb pq_desc
+    /* snapshot the interconnect counters, program + start queue i */
+    movl 0x10(%ebp), %eax
+    movl %eax, pq_rd(%rip)
+    movl 0x14(%ebp), %eax
+    movl %eax, pq_wr(%rip)
+    movl %r15d, 0x40(%esi)    /* queue select */
+    movl %r12d, 0x44(%esi)
+    movl $0, 0x48(%esi)
+    movl $4, 0x4c(%esi)
+    movl $16, 0x50(%esi)
+    movl $1, 0x54(%esi)       /* start queue i */
+    movl $30000000, %ecx
+pq_wait:
+    movl 0x58(%esi), %eax
+    cmpl $4, %eax
+    je pq_done
+    decl %ecx
+    jnz pq_wait
+pq_done:
+    cmpl $4, 0x58(%esi)
+    je 1f
+    incl fail(%rip)
+1:  /* completion MSI-X must land on CPU i.  Edge MSI-X to the same
+     * vector coalesce (the device fires 4 back-to-back), so assert
+     * delivery (>= 1) here - the ring_done check above already proved
+     * all four messages completed. */
+    movl %r15d, %eax
+    shll $5, %eax
+    addl $0x9100, %eax
+    movl %eax, %edx
+    movl $1, %eax
+    call wait_pq_cnt
+    /* direct local reads: rd delta 0 (own-page src is direct);
+     * counted cross-node writes: wr delta 0x40 (4 x 64 bytes =
+     * dword writes through the interconnect) */
+    movl 0x10(%ebp), %eax
+    subl pq_rd(%rip), %eax
+    movl %eax, pq_rd_delta(%rip)
+    jz 2f
+    incl fail(%rip)
+2:  movl 0x14(%ebp), %eax
+    subl pq_wr(%rip), %eax
+    movl %eax, pq_wr_delta(%rip)
+    cmpl $0x40, %eax
+    je 3f
+    incl fail(%rip)
+3:  /* coherent cross-node data at the next node's page + 0x200 */
+    movl %r15d, %eax
+    addl $1, %eax
+    andl $3, %eax
+    shll $12, %eax
+    addl $0xdf000000, %eax
+    addl $0x200, %eax
+    movl (%eax), %edx
+    cmpl pq_pat(%rip), %edx
+    je 4f
+    incl fail(%rip)
+4:  /* save CPU i's per-queue count */
+    movl %r15d, %eax
+    shll $5, %eax
+    addl $0x9100, %eax
+    movl 28(%eax), %ecx
+    movl %r15d, %eax
+    shll $2, %eax
+    lea pq_cnt(%rip), %rdi
+    add %rax, %rdi
+    movl %ecx, (%rdi)
+    incl %r15d
+    cmpl $4, %r15d
+    jb pq_loop
+    /* each CPU i saw its own per-queue vector (mask 1<<i, >= 1
+     * delivery; the rest coalesce) */
+    xorl %ebx, %ebx
+pq_chk:
+    movl $1, %r9d
+    movl %ebx, %ecx
+    shll %cl, %r9d            /* expected mask bit */
+    movl %ebx, %eax
+    shll $5, %eax
+    addl $0x9100, %eax
+    cmpl %r9d, 24(%eax)
+    jne pq_bad
+    cmpl $1, 28(%eax)
+    jge pq_next
+pq_bad:
+    incl fail(%rip)
+pq_next:
+    incl %ebx
+    cmpl $4, %ebx
+    jb pq_chk
+
     /* --- report ---- */
     lea ok(%rip), %rsi
     call puts
@@ -438,6 +859,10 @@ ap_done:
 1:  lea okmsg(%rip), %rsi
     call puts
 2:
+    lea sp_f(%rip), %rsi
+    call puts
+    movl fail(%rip), %eax
+    call puthex
     movl $0x9100, %edx
     movl 16(%edx), %eax
     movl %eax, bsp_msi(%rip)
@@ -535,6 +960,38 @@ ap_done:
     lea sp_slash(%rip), %rsi
     call puts
     movl pv3(%rip), %eax
+    call puthex
+    lea sp_dma(%rip), %rsi
+    call puts
+    movl bsp_dma(%rip), %eax
+    call puthex
+    lea sp_slash(%rip), %rsi
+    call puts
+    movl rd_delta(%rip), %eax
+    call puthex
+    lea sp_slash(%rip), %rsi
+    call puts
+    movl wr_delta(%rip), %eax
+    call puthex
+    lea sp_ring(%rip), %rsi
+    call puts
+    movl ring_done_cnt(%rip), %eax
+    call puthex
+    lea sp_pq(%rip), %rsi
+    call puts
+    movl pq_cnt(%rip), %eax
+    call puthex
+    lea sp_slash(%rip), %rsi
+    call puts
+    movl pq_cnt+4(%rip), %eax
+    call puthex
+    lea sp_slash(%rip), %rsi
+    call puts
+    movl pq_cnt+8(%rip), %eax
+    call puthex
+    lea sp_slash(%rip), %rsi
+    call puts
+    movl pq_cnt+12(%rip), %eax
     call puthex
     lea nl(%rip), %rsi
     call puts
@@ -673,6 +1130,29 @@ common_irq:
     movl 48(%rsp), %eax       /* vector pushed by the stub */
     cmpl $0x50, %eax
     je 1f
+    cmpl $0x70, %eax
+    je 4f
+    cmpl $0x80, %eax
+    jb 6f
+    cmpl $0x83, %eax
+    ja 6f
+    /* per-queue DMA completion MSI-X vector 0x80..0x83: my slot,
+     * per-queue mask bit (vector - 0x80) + count */
+    movl 0x20(%r10d), %esi
+    shrl $24, %esi
+    movl %esi, %eax
+    shll $5, %eax
+    addl $0x9100, %eax
+    movl %eax, %edx
+    movl 48(%rsp), %eax
+    subl $0x80, %eax
+    movl %eax, %ecx           /* cl = vector offset */
+    movl $1, %eax
+    shll %cl, %eax            /* bit = 1 << offset */
+    orl %eax, 24(%edx)
+    incl 28(%edx)
+    jmp 3f
+6:
     cmpl $0x60, %eax
     jb 3f
     cmpl $0x63, %eax
@@ -700,6 +1180,15 @@ common_irq:
     addl $0x9100, %eax
     movl %eax, %edx
     incl 16(%edx)
+    jmp 3f
+4:  /* DMA-completion MSI-X vector 0x70: my slot, dma count */
+    movl 0x20(%r10d), %esi
+    shrl $24, %esi
+    movl %esi, %eax
+    shll $5, %eax
+    addl $0x9100, %eax
+    movl %eax, %edx
+    incl 20(%edx)
 3:
     movl $0, 0xb0(%r10d)      /* LAPIC EOI for every vector */
     /* PIC EOI (master always, slave for 0x28..0x2f) */
@@ -794,7 +1283,7 @@ findcap:
 /* wait_msix_cnt: edx=slot base, eax=min count (clobbers ecx, r9d) */
 wait_msix_cnt:
     movl %eax, %r9d
-    movl $200000000, %ecx
+    movl $30000000, %ecx
 1:  cmpl %r9d, 12(%edx)
     jge 2f
     decl %ecx
@@ -804,8 +1293,18 @@ wait_msix_cnt:
 /* wait_msi_cnt: edx=slot base, eax=min count (clobbers ecx, r9d) */
 wait_msi_cnt:
     movl %eax, %r9d
-    movl $200000000, %ecx
+    movl $30000000, %ecx
 1:  cmpl %r9d, 16(%edx)
+    jge 2f
+    decl %ecx
+    jnz 1b
+2:  ret
+
+/* wait_pq_cnt: edx=slot base, eax=min count (clobbers ecx, r9d) */
+wait_pq_cnt:
+    movl %eax, %r9d
+    movl $30000000, %ecx
+1:  cmpl %r9d, 28(%edx)
     jge 2f
     decl %ecx
     jnz 1b
@@ -869,10 +1368,30 @@ pv0:        .long 0
 pv1:        .long 0
 pv2:        .long 0
 pv3:        .long 0
+dma_dev:    .long 0
+dma_bar0:   .long 0
+dma_bar1:   .long 0
+rd0:        .long 0
+wr0:        .long 0
+rd1:        .long 0
+wr1:        .long 0
+dma_before: .long 0
+bsp_dma:    .long 0
+rd_delta:   .long 0
+wr_delta:   .long 0
+ring_done_cnt: .long 0
+dma_tab:    .long 0
+pq_pat:     .long 0
+pq_rd:      .long 0
+pq_wr:      .long 0
+pq_rd_delta: .long 0
+pq_wr_delta: .long 0
+pq_cnt:     .long 0, 0, 0, 0
 ok:         .asciz "MSIX EFI "
 okmsg:      .asciz "OK"
 failmsg:    .asciz "FAIL"
 sp_msi:     .asciz " msi="
+sp_f:       .asciz " f="
 sp_ids:     .asciz " ids="
 sp_m0:      .asciz " m0="
 sp_m1:      .asciz " m1="
@@ -881,6 +1400,9 @@ sp_m3:      .asciz " m3="
 sp_neg:     .asciz " neg="
 sp_dev:     .asciz " dev="
 sp_pv:      .asciz " pv="
+sp_dma:     .asciz " dma="
+sp_ring:    .asciz " ring="
+sp_pq:      .asciz " pq="
 sp_slash:   .asciz "/"
 nl:         .asciz "\n"
     .balign 16
