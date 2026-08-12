@@ -30,6 +30,11 @@ config EDU
     default y if TEST_DEVICES
     depends on PCI && MSI_NONBROKEN
 
+config NTO64_MSIX
+    bool
+    default y
+    depends on PCI
+
 config NTO64_IRQGEN
     bool
     default y

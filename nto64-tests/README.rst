@@ -254,3 +254,26 @@ Run ``make run-irqtest``.
    case in this tree depends on telling them apart.  One source per
    device: several devices storming at once is only as interesting as the
    I/O APIC makes it.
+
+
+MSI-X with per-vector destinations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nto64-msix`` (PCI ``1234:1ee8``, ``vectors`` default 4) carries its
+MSI-X table and PBA in an exclusive BAR1, with BAR0 controls ``0x00``
+magic, ``0x04`` control (bit0 enable), ``0x08`` fire count, ``0x0c``
+vector select, ``0x10`` trigger, ``0x14`` fire mask and ``0x18`` onwards
+per-vector counts.
+
+Run ``make run-msixtest``, which brings up the secondary CPUs under OVMF,
+aims four vectors at four local APICs with distinct masks, fires them
+individually and as a burst, and compares each APIC's handler count
+against the device's per-vector counters.
+
+.. note::
+   An exclusive BAR for the table is deliberate: a mapping error cannot
+   hide behind a neighbouring register file.  A destination the guest did
+   not arm is dropped rather than delivered somewhere convenient.  Under
+   TCG, same-vector edge messages fired rapidly coalesce in the IRR, as
+   edge-triggered semantics require, so a case asserts a minimum
+   delivery count and proves completion by data.

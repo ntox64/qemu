@@ -9,6 +9,9 @@ run-irqtest: irqtest
 	$(QEMU) -device nto64-irqgen -kernel irqtest -serial stdio \
 	    -display none -no-reboot
 
+msix-fat.img: BOOTX64-msix.EFI fatimg.py
+	python3 fatimg.py BOOTX64-msix.EFI $@
 
-EXTRA_BUILT +=
+
+EXTRA_BUILT += msix-fat.img
 RUNTARGETS += run-irqtest
