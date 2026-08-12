@@ -16,6 +16,7 @@
 #include "exec/target_page.h"
 #include "exec/translator.h"
 #include "exec/plugin-gen.h"
+#include "exec/instrument-gen.h"
 #include "tcg/tcg-op-common.h"
 #include "internal-common.h"
 #include "disas/disas.h"
@@ -227,6 +228,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     if (plugin_enabled) {
         plugin_gen_tb_end(cpu, db->num_insns);
     }
+    tcg_gen_inject_instrument_hooks();
 
     if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)
         && qemu_log_in_addr_range(db->pc_first)) {

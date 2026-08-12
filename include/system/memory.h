@@ -77,6 +77,60 @@ extern unsigned int global_dirty_tracking;
 
 typedef struct MemoryRegionOps MemoryRegionOps;
 
+/*
+ * Per-access hook for instrumented RAM regions: called from the TCG
+ * slow path for every load/store to the region, with the vCPU index,
+ * the guest address, the access size and the direction.  The access
+ * itself is direct RAM (fast, coherent); the hook can count and/or
+ * inject a modelled latency.  No BQL is held.
+ */
+typedef void (*MemoryRegionInstrumentHook)(void *opaque,
+                                           unsigned int vcpu_index,
+                                           hwaddr addr, unsigned size,
+                                           bool is_write);
+
+/*
+ * Resolved per-access instrument hook (hook + opaque), stored in TLB
+ * entries and in the parallel instr_table so both the inline and slow
+ * paths can run the hook without a per-access region lookup.
+ */
+typedef struct InstrumentDesc {
+    MemoryRegionInstrumentHook hook;
+    void *opaque;
+} InstrumentDesc;
+
+/*
+ * Address-range instrument registration: the whole-RAM node slices are
+ * aliases of the machine RAM (one ram_addr identity, so TCG code
+ * invalidation stays coherent), and the per-node instrumentation is
+ * resolved by physical range at TLB fill instead of via a separate
+ * MemoryRegion.  @owner is the vCPU index that owns the range (direct,
+ * un-instrumented for it; instrumented for every other vCPU).
+ */
+typedef struct MemoryRegionInstrumentRange {
+    hwaddr base;
+    hwaddr size;
+    int owner;
+    InstrumentDesc desc;
+} MemoryRegionInstrumentRange;
+
+void memory_region_register_instrument_range(hwaddr base, hwaddr size,
+                                             int owner,
+                                             MemoryRegionInstrumentHook hook,
+                                             void *opaque);
+const MemoryRegionInstrumentRange *memory_region_instrument_range_find(
+    hwaddr addr);
+
+/*
+ * Mark @mr as instrumented RAM: TCG routes data loads/stores to it
+ * through the inline per-access hook (count/delay) while keeping the
+ * direct-RAM fast path.  Must be called before vCPUs start executing so
+ * translation sees the instrumentation from the first TB.
+ */
+void memory_region_set_instrumented(MemoryRegion *mr,
+                                    MemoryRegionInstrumentHook hook,
+                                    void *opaque);
+
 struct ReservedRegion {
     Range range;
     unsigned type;
@@ -832,6 +886,18 @@ struct MemoryRegion {
     bool readonly; /* For RAM regions */
     bool nonvolatile;
     bool rom_device;
+    /*
+     * If true and instrument_hook is set, TCG routes loads/stores to
+     * this RAM region through the slow path and calls instrument_hook
+     * per access before the direct RAM access.  This is the built-in
+     * form of the plugin-based manual latency: memory-op speed is
+     * preserved (~100ns overhead, no MMIO dispatch, no io recompile)
+     * while counting and a tunable delay stay exact.
+     */
+    bool instrument_ram;
+    MemoryRegionInstrumentHook instrument_hook;
+    /* Resolved per-access hook descriptor for the TLB. */
+    InstrumentDesc *instrument_desc;
     bool flush_coalesced_mmio;
     bool lockless_io;
     bool unmergeable;

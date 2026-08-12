@@ -51,6 +51,14 @@ typedef struct CPUTLBDescFast {
     uintptr_t mask;
     /* The array of tlb entries itself. */
     CPUTLBEntry *table;
+    /*
+     * Parallel per-set array of instrumented MemoryRegion pointers (or
+     * NULL), filled by tlb_set_page_full and read by TCG-generated code
+     * to gate the inline instrument hook.  One pointer per TLB set.
+     */
+    void **instr_table;
+    /* Keep the struct a multiple of the alignment for the f[] array. */
+    uintptr_t pad;
 } CPUTLBDescFast QEMU_ALIGNED(2 * sizeof(void *));
 
 #endif /* EXEC_TLB_COMMON_H */

@@ -30,9 +30,39 @@
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
 #include "exec/plugin-gen.h"
+#include "exec/instrument-gen.h"
 #include "tcg-internal.h"
 #include "tcg-has.h"
 #include "tcg-target-mo.h"
+
+/*
+ * Emit the instrumented-RAM marker for one data load/store.
+ * The marker is replaced at TB translation time by an inline, TLB-gated
+ * call to the region hook, placed before the memory op itself.  Nothing
+ * is emitted when no instrumented region exists, so un-instrumented
+ * translation pays nothing.
+ */
+static void tcg_gen_insn_mem_hook(TCGTemp *addr, TCGArg mmu_idx,
+                                  MemOp memop, bool is_write)
+{
+    unsigned size = 1 << (memop & MO_SIZE);
+
+    if (!tcg_has_instrumented_ram) {
+        return;
+    }
+    if (tcg_ctx->addr_type == TCG_TYPE_I32) {
+        TCGv_i64 a = tcg_temp_ebb_new_i64();
+
+        tcg_gen_extu_i32_i64(a, temp_tcgv_i32(addr));
+        tcg_gen_op4(INDEX_op_insn_mem_hook, 0, tcgv_i64_arg(a),
+                    size, is_write, mmu_idx);
+        tcg_temp_free_i64(a);
+    } else {
+        tcg_gen_op4(INDEX_op_insn_mem_hook, 0,
+                    tcgv_i64_arg(temp_tcgv_i64(addr)),
+                    size, is_write, mmu_idx);
+    }
+}
 
 static void check_max_alignment(unsigned a_bits)
 {
@@ -273,6 +303,7 @@ static void tcg_gen_qemu_ld_i32_int(TCGv_i32 val, TCGTemp *addr,
 
     addr_new = tci_extend_addr(addr);
     copy_addr = plugin_maybe_preserve_addr(addr);
+    tcg_gen_insn_mem_hook(addr, idx, memop, false);
     gen_ldst1(INDEX_op_qemu_ld, TCG_TYPE_I32, tcgv_i32_temp(val), addr_new, oi);
 
     if ((orig_memop ^ memop) & MO_BSWAP) {
@@ -331,6 +362,7 @@ static void tcg_gen_qemu_st_i32_int(TCGv_i32 orig_val, TCGTemp *addr,
     }
 
     addr_new = tci_extend_addr(addr);
+    tcg_gen_insn_mem_hook(addr, idx, memop, true);
     gen_ldst1(INDEX_op_qemu_st, TCG_TYPE_I32, tcgv_i32_temp(val), addr_new, oi);
     plugin_gen_mem_callbacks_i32(orig_val, NULL, addr, orig_oi,
                                  QEMU_PLUGIN_MEM_W);
@@ -382,6 +414,7 @@ static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
 
     addr_new = tci_extend_addr(addr);
     copy_addr = plugin_maybe_preserve_addr(addr);
+    tcg_gen_insn_mem_hook(addr, idx, memop, false);
     gen_ld_i64(val, addr_new, oi);
 
     if ((orig_memop ^ memop) & MO_BSWAP) {
@@ -452,6 +485,7 @@ static void tcg_gen_qemu_st_i64_int(TCGv_i64 orig_val, TCGTemp *addr,
     }
 
     addr_new = tci_extend_addr(addr);
+    tcg_gen_insn_mem_hook(addr, idx, memop, true);
     gen_st_i64(val, addr_new, oi);
     plugin_gen_mem_callbacks_i64(orig_val, NULL, addr, orig_oi,
                                  QEMU_PLUGIN_MEM_W);
@@ -568,6 +602,13 @@ static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
     TCGv_i64 ext_addr = NULL;
     TCGTemp *addr_new;
 
+    /*
+     * One hook per 128-bit guest access (matching the helper path).
+     * On hosts without qemu_ldst_i128 the helper fallback also runs the
+     * slow-path hook, which would double count; that path is unused on
+     * the x86-64 testbed.
+     */
+    tcg_gen_insn_mem_hook(addr, idx, memop, false);
     check_max_alignment(memop_alignment_bits(memop));
     tcg_gen_req_mo(TCG_MO_LD_LD | TCG_MO_ST_LD);
 
@@ -681,6 +722,7 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
     TCGv_i64 ext_addr = NULL;
     TCGTemp *addr_new;
 
+    tcg_gen_insn_mem_hook(addr, idx, memop, true);
     check_max_alignment(memop_alignment_bits(memop));
     tcg_gen_req_mo(TCG_MO_ST_LD | TCG_MO_ST_ST);
 

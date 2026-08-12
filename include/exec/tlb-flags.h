@@ -52,10 +52,18 @@
 #define TLB_DISCARD_WRITE    (1 << 3)
 /* Set if TLB entry is an IO callback.  */
 #define TLB_MMIO             (1 << 4)
+/*
+ * Set if the page is instrumented RAM.  Unlike TLB_MMIO this does not
+ * force the slow path: instrumented pages hit the TCG fast path with a
+ * per-access hook emitted inline at translation time.  The flag
+ * remains in slow_flags so that genuine slow-path entries (TLB miss,
+ * watchpoints) still run the hook once.
+ */
+#define TLB_INSTRUMENT       (1 << 5)
 
 #define TLB_SLOW_FLAGS_MASK \
     (TLB_BSWAP | TLB_WATCHPOINT | TLB_CHECK_ALIGNED | \
-     TLB_DISCARD_WRITE | TLB_MMIO)
+     TLB_DISCARD_WRITE | TLB_MMIO | TLB_INSTRUMENT)
 
 /*
  * Flags stored in CPUTLBEntry.addr_idx[x].

@@ -35,10 +35,77 @@
 #include "hw/boards.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
+#include "exec/instrument-gen.h"
 
 #include "memory-internal.h"
 
 //#define DEBUG_UNASSIGNED
+
+void memory_region_set_instrumented(MemoryRegion *mr,
+                                    MemoryRegionInstrumentHook hook,
+                                    void *opaque)
+{
+    /*
+     * The instrumentation is a hook on the direct-RAM TCG path: the TLB
+     * entry keeps its RAM addend and its ram_addr identity, so a region
+     * without host memory behind it cannot be instrumented at all.
+     */
+    assert(mr->ram);
+    mr->instrument_ram = true;
+    mr->instrument_hook = hook;
+    mr->opaque = opaque;
+    {
+        InstrumentDesc *d = g_new(InstrumentDesc, 1);
+        d->hook = hook;
+        d->opaque = opaque;
+        mr->instrument_desc = d;
+    }
+#ifdef CONFIG_TCG
+    tcg_has_instrumented_ram = true;
+#endif
+}
+
+static GArray *instrument_ranges;
+
+void memory_region_register_instrument_range(hwaddr base, hwaddr size,
+                                             int owner,
+                                             MemoryRegionInstrumentHook hook,
+                                             void *opaque)
+{
+    MemoryRegionInstrumentRange r = {
+        .base = base,
+        .size = size,
+        .owner = owner,
+        .desc = { .hook = hook, .opaque = opaque },
+    };
+
+    if (!instrument_ranges) {
+        instrument_ranges = g_array_new(false, true,
+                                        sizeof(MemoryRegionInstrumentRange));
+    }
+    g_array_append_val(instrument_ranges, r);
+#ifdef CONFIG_TCG
+    tcg_has_instrumented_ram = true;
+#endif
+}
+
+const MemoryRegionInstrumentRange *memory_region_instrument_range_find(
+    hwaddr addr)
+{
+    MemoryRegionInstrumentRange *r;
+    unsigned int i;
+
+    if (!instrument_ranges) {
+        return NULL;
+    }
+    for (i = 0; i < instrument_ranges->len; i++) {
+        r = &g_array_index(instrument_ranges, MemoryRegionInstrumentRange, i);
+        if (addr >= r->base && addr < r->base + r->size) {
+            return r;
+        }
+    }
+    return NULL;
+}
 
 static unsigned memory_region_transaction_depth;
 static bool memory_region_update_pending;

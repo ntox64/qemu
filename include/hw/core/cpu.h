@@ -249,6 +249,13 @@ struct CPUTLBEntryFull {
     uint8_t slow_flags[MMU_ACCESS_COUNT];
 
     /*
+     * Resolved instrument hook for this page (NULL for plain RAM), filled
+     * by tlb_set_page_full from the region or the nto64 slice range table.
+     * Used by the slow path so no per-access region lookup is needed.
+     */
+    void *instrument_desc;
+
+    /*
      * Allow target-specific additions to this structure.
      * This may be used to cache items from the guest cpu
      * page tables for later use by the implementation.

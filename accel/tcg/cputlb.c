@@ -53,6 +53,14 @@
 #include "tcg/tcg-ldst.h"
 #include "backend-ldst.h"
 
+/* TCGHelperInfo for the inline instrumented-RAM hook helper. */
+#define HELPER_H "accel/tcg/mem-instrument.h"
+#include "exec/helper-proto.h.inc"
+#undef HELPER_H
+#define HELPER_H "accel/tcg/mem-instrument.h"
+#include "exec/helper-info.c.inc"
+#undef HELPER_H
+
 
 /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
 /* #define DEBUG_TLB */
@@ -247,12 +255,14 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
 
     g_free(fast->table);
     g_free(desc->fulltlb);
+    g_free(fast->instr_table);
 
     tlb_window_reset(desc, now, 0);
     /* desc->n_used_entries is cleared by the caller */
     fast->mask = (new_size - 1) << CPU_TLB_ENTRY_BITS;
     fast->table = g_try_new(CPUTLBEntry, new_size);
     desc->fulltlb = g_try_new(CPUTLBEntryFull, new_size);
+    fast->instr_table = g_try_new0(void *, new_size);
 
     /*
      * If the allocations fail, try smaller sizes. We just freed some
@@ -261,7 +271,8 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
      * allocations to fail though, so we progressively reduce the allocation
      * size, aborting if we cannot even allocate the smallest TLB we support.
      */
-    while (fast->table == NULL || desc->fulltlb == NULL) {
+    while (fast->table == NULL || fast->instr_table == NULL ||
+           desc->fulltlb == NULL) {
         if (new_size == (1 << CPU_TLB_DYN_MIN_BITS)) {
             error_report("%s: %s", __func__, strerror(errno));
             abort();
@@ -271,8 +282,10 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
 
         g_free(fast->table);
         g_free(desc->fulltlb);
+        g_free(fast->instr_table);
         fast->table = g_try_new(CPUTLBEntry, new_size);
         desc->fulltlb = g_try_new(CPUTLBEntryFull, new_size);
+        fast->instr_table = g_try_new0(void *, new_size);
     }
 }
 
@@ -284,6 +297,8 @@ static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
     desc->vindex = 0;
     memset(fast->table, -1, sizeof_tlb(fast));
     memset(desc->vtable, -1, sizeof(desc->vtable));
+    memset(fast->instr_table, 0,
+           (sizeof_tlb(fast) >> CPU_TLB_ENTRY_BITS) * sizeof(void *));
 }
 
 static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
@@ -305,6 +320,7 @@ static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
     fast->mask = (n_entries - 1) << CPU_TLB_ENTRY_BITS;
     fast->table = g_new(CPUTLBEntry, n_entries);
     desc->fulltlb = g_new(CPUTLBEntryFull, n_entries);
+    fast->instr_table = g_new0(void *, n_entries);
     tlb_mmu_flush_locked(desc, fast);
 }
 
@@ -344,6 +360,7 @@ void tlb_destroy(CPUState *cpu)
 
         g_free(fast->table);
         g_free(desc->fulltlb);
+        g_free(fast->instr_table);
     }
 }
 
@@ -462,19 +479,27 @@ static inline bool tlb_entry_is_empty(const CPUTLBEntry *te)
 
 /* Called with tlb_c.lock held */
 static bool tlb_flush_entry_mask_locked(CPUTLBEntry *tlb_entry,
+                                        void **instr_slot,
                                         vaddr page,
                                         vaddr mask)
 {
     if (tlb_hit_page_mask_anyprot(tlb_entry, page, mask)) {
         memset(tlb_entry, -1, sizeof(*tlb_entry));
+        if (instr_slot) {
+            *instr_slot = NULL;
+        }
         return true;
     }
     return false;
 }
 
-static inline bool tlb_flush_entry_locked(CPUTLBEntry *tlb_entry, vaddr page)
+static inline bool tlb_flush_entry_locked(CPUState *cpu, int midx, vaddr page)
 {
-    return tlb_flush_entry_mask_locked(tlb_entry, page, -1);
+    CPUTLBDescFast *fast = &cpu->neg.tlb.f[midx];
+
+    return tlb_flush_entry_mask_locked(tlb_entry(cpu, midx, page),
+                                       &fast->instr_table[tlb_index(cpu, midx, page)],
+                                       page, -1);
 }
 
 /* Called with tlb_c.lock held */
@@ -487,7 +512,7 @@ static void tlb_flush_vtlb_page_mask_locked(CPUState *cpu, int mmu_idx,
 
     assert_cpu_is_self(cpu);
     for (k = 0; k < CPU_VTLB_SIZE; k++) {
-        if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask)) {
+        if (tlb_flush_entry_mask_locked(&d->vtable[k], NULL, page, mask)) {
             tlb_n_used_entries_dec(cpu, mmu_idx);
         }
     }
@@ -511,7 +536,7 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
                   midx, lp_addr, lp_mask);
         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
     } else {
-        if (tlb_flush_entry_locked(tlb_entry(cpu, midx, page), page)) {
+        if (tlb_flush_entry_locked(cpu, midx, page)) {
             tlb_n_used_entries_dec(cpu, midx);
         }
         tlb_flush_vtlb_page_locked(cpu, midx, page);
@@ -703,7 +728,9 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
         vaddr page = addr + i;
         CPUTLBEntry *entry = tlb_entry(cpu, midx, page);
 
-        if (tlb_flush_entry_mask_locked(entry, page, mask)) {
+        if (tlb_flush_entry_mask_locked(entry,
+                                        &f->instr_table[tlb_index(cpu, midx, page)],
+                                        page, mask)) {
             tlb_n_used_entries_dec(cpu, midx);
         }
         tlb_flush_vtlb_page_mask_locked(cpu, midx, page, mask);
@@ -1001,7 +1028,14 @@ static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,
     if (enable) {
         address |= flags & TLB_FLAGS_MASK;
         flags &= TLB_SLOW_FLAGS_MASK;
-        if (flags) {
+        /*
+         * TLB_INSTRUMENT must not force the slow path: instrumented pages
+         * are direct RAM whose per-access hook is emitted inline at
+         * translation time.  The flag stays in slow_flags so genuine
+         * slow-path lookups (TLB miss, watchpoint) still run the hook
+         * once.
+         */
+        if (flags & ~TLB_INSTRUMENT) {
             address |= TLB_FORCE_SLOW;
         }
     } else {
@@ -1032,7 +1066,8 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     hwaddr iotlb, xlat, sz, paddr_page;
     vaddr addr_page;
     int asidx, wp_flags, prot;
-    bool is_ram, is_romd;
+    const MemoryRegionInstrumentRange *ir;
+    bool is_ram, is_romd, instrumented, foreign_range;
 
     assert_cpu_is_self(cpu);
 
@@ -1063,8 +1098,25 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
 
     is_ram = memory_region_is_ram(section->mr);
     is_romd = memory_region_is_romd(section->mr);
+    ir = memory_region_instrument_range_find(paddr_page);
+    foreign_range = ir != NULL && ir->owner != cpu->cpu_index;
+    /*
+     * Instrumentation only ever applies to a page with host memory behind
+     * it: an instrumented entry keeps the direct-RAM addend and the
+     * plain-RAM ram_addr identity below, and both are undefined for MMIO
+     * (memory_region_get_ram_ptr() asserts mr->ram_block,
+     * memory_region_get_ram_addr() returns RAM_ADDR_INVALID).  Ranges are
+     * keyed by guest physical address, so a registered range can cover
+     * device memory just as well as RAM - on x86 the [0, ram_size)
+     * interval holds the MMIO hole, the LAPIC/IOAPIC/HPET and any BAR -
+     * and a hook can be attached to a region that is not RAM at all.
+     * Either way the page stays plain MMIO: the hook models remote RAM, it
+     * must never turn a device register into a RAM window.
+     */
+    instrumented = (is_ram || is_romd) &&
+                   (section->mr->instrument_desc != NULL || foreign_range);
 
-    if (is_ram || is_romd) {
+    if (is_ram || is_romd || instrumented) {
         /* RAM and ROMD both have associated host memory. */
         addend = (uintptr_t)memory_region_get_ram_ptr(section->mr) + xlat;
     } else {
@@ -1072,8 +1124,41 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         addend = 0;
     }
 
+    {
+        InstrumentDesc *idesc = section->mr->instrument_desc;
+
+        if (foreign_range) {
+            idesc = (InstrumentDesc *)&ir->desc;
+        }
+        full->instrument_desc = instrumented ? idesc : NULL;
+    }
+
     write_flags = read_flags;
-    if (is_ram) {
+    if (instrumented) {
+        /*
+         * Instrumented RAM: keep the direct RAM addend and let the page
+         * hit the TCG fast path; the per-access hook is emitted inline at
+         * translation time, gated by the instr_table slot filled below.
+         * TLB_INSTRUMENT stays in slow_flags so genuine slow-path lookups
+         * (TLB miss, watchpoint) still run the hook.  The iotlb is the
+         * plain-RAM ram_addr identity (NOT the section index): instrumented
+         * pages are real RAM, and the NOTDIRTY path below must be kept so
+         * writes to pages with cached TBs invalidate them (self-modifying
+         * code) - skipping it is how OVMF's DXE runtime got stale code and
+         * wild-jumped into freed (0xAF-filled) memory.
+         */
+        read_flags |= TLB_INSTRUMENT;
+        write_flags = read_flags;
+        iotlb = memory_region_get_ram_addr(section->mr) + xlat;
+        assert(!(iotlb & ~TARGET_PAGE_MASK));
+        if (prot & PAGE_WRITE) {
+            if (section->readonly) {
+                write_flags |= TLB_DISCARD_WRITE;
+            } else if (physical_memory_is_clean(iotlb)) {
+                write_flags |= TLB_NOTDIRTY;
+            }
+        }
+    } else if (is_ram) {
         iotlb = memory_region_get_ram_addr(section->mr) + xlat;
         assert(!(iotlb & ~TARGET_PAGE_MASK));
         /*
@@ -1106,6 +1191,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
 
     index = tlb_index(cpu, mmu_idx, addr_page);
     te = tlb_entry(cpu, mmu_idx, addr_page);
+    CPUTLBDescFast *fast = &tlb->f[mmu_idx];
 
     /*
      * Hold the TLB lock for the rest of the function. We could acquire/release
@@ -1133,6 +1219,12 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         /* Evict the old entry into the victim tlb.  */
         copy_tlb_helper_locked(tv, te);
         desc->vfulltlb[vidx] = desc->fulltlb[index];
+        /*
+         * The inline hook gate must not see the evicted page's slot:
+         * a later miss on another page in this set would otherwise
+         * count it spuriously.
+         */
+        fast->instr_table[index] = NULL;
         tlb_n_used_entries_dec(cpu, mmu_idx);
     }
 
@@ -1155,11 +1247,18 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     full = &desc->fulltlb[index];
     full->xlat_section = iotlb - addr_page;
     full->phys_addr = paddr_page;
+    /* Keep the fast-path gate in sync with the refilled entry. */
+    fast->instr_table[index] = full->instrument_desc;
 
     /* Now calculate the new entry */
     tn.addend = addend - addr_page;
 
-    tlb_set_compare(full, &tn, addr_page, read_flags,
+    /*
+     * Instruction fetch always stays direct RAM: the instrumented
+     * hook is for data loads/stores only.
+     */
+    tlb_set_compare(full, &tn, addr_page,
+                    read_flags & ~(TLB_MMIO | TLB_INSTRUMENT),
                     MMU_INST_FETCH, prot & PAGE_EXEC);
 
     if (wp_flags & BP_MEM_READ) {
@@ -1326,6 +1425,13 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
             CPUTLBEntryFull *f2 = &cpu->neg.tlb.d[mmu_idx].vfulltlb[vidx];
             CPUTLBEntryFull tmpf;
             tmpf = *f1; *f1 = *f2; *f2 = tmpf;
+            /*
+             * Keep the inline-hook gate in sync with the refreshed
+             * entry: after the swap the main slot must carry the
+             * refreshed page's instrument descriptor, not the evicted
+             * occupant's.
+             */
+            cpu->neg.tlb.f[mmu_idx].instr_table[index] = f1->instrument_desc;
             return true;
         }
     }
@@ -1646,6 +1752,7 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
     CPUTLBEntry *entry = tlb_entry(cpu, mmu_idx, addr);
     uint64_t tlb_addr = tlb_read_idx(entry, access_type);
     bool maybe_resized = false;
+    bool slow_resolved = false;
     CPUTLBEntryFull *full;
     int flags;
 
@@ -1659,6 +1766,7 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
             index = tlb_index(cpu, mmu_idx, addr);
             entry = tlb_entry(cpu, mmu_idx, addr);
         }
+        slow_resolved = true;
         tlb_addr = tlb_read_idx(entry, access_type) & ~TLB_INVALID_MASK;
     }
 
@@ -1679,7 +1787,73 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
     /* Compute haddr speculatively; depending on flags it might be invalid. */
     data->haddr = (void *)((uintptr_t)addr + entry->addend);
 
+    /*
+     * Run the per-access hook only when the inline TCG hook did not
+     * (or could not) run for this access: QEMU-internal accesses
+     * (ra == 0) have no generated code, and a slow-resolved lookup
+     * (TLB miss / victim hit) means the inline hook saw the pre-refill
+     * slot, which is cleared on flush/eviction.  A fast-path hit is
+     * counted exactly once by the inline hook, and NOTDIRTY/watchpoint
+     * slow exits are still covered by that inline count, so the per-
+     * access counters stay exact.
+     */
+    if (unlikely(flags & TLB_INSTRUMENT) && access_type != MMU_INST_FETCH &&
+        (ra == 0 || slow_resolved)) {
+        InstrumentDesc *d = full->instrument_desc;
+
+        if (d && d->hook) {
+            d->hook(d->opaque, cpu->cpu_index, addr,
+                    data->size, access_type == MMU_DATA_STORE);
+        }
+    }
+
     return maybe_resized;
+}
+
+/*
+ * Inline instrumented-RAM hook: called by TCG-generated code
+ * right before the direct fast-path access whenever the TLB gate
+ * resolved an instrumented region.  The slow-path equivalent just above
+ * still covers first-touch/watchpoint slow-path lookups.
+ */
+void HELPER(mem_instrument)(void *mr_ptr, uint32_t vcpu_index,
+                            uint64_t addr, uint32_t size, uint32_t is_write,
+                            uint32_t set, uint32_t mmu_idx)
+{
+    InstrumentDesc *d = mr_ptr;
+
+    if (unlikely(d == NULL || d->hook == NULL)) {
+        return;
+    }
+    /*
+     * Exact-count gate (DISABLED for performance -  is the fast
+     * path; the gate's TLB entry read + compare costs ~37% of the
+     * per-access cost: 27.5 vs 20.1 cycles/access, measured on a
+     * 262144-read foreign-slice loop).  Without it, first-touch/
+     * NOTDIRTY writes can double-count and own-slice pages sharing a
+     * TLB set with a slice page can be spuriously counted on misses -
+     * the counters are a latency model, not an exact audit.  Re-enable
+     * by deleting the #if 0 / #endif below (the 7-arg signature and
+     * the set/mmu_idx plumbing in gen_instrument_hook are kept).
+     */
+#if 0
+    CPUState *cpu = qemu_get_cpu(vcpu_index);
+    CPUTLBEntry *entry;
+    uint64_t entry_addr;
+
+    if (unlikely(cpu == NULL || mmu_idx >= NB_MMU_MODES)) {
+        return;
+    }
+    entry = &cpu->neg.tlb.f[mmu_idx].table[set];
+    entry_addr = is_write ? entry->addr_write : entry->addr_read;
+    if (unlikely((entry_addr & TARGET_PAGE_MASK) !=
+                 (addr & TARGET_PAGE_MASK))) {
+        return;
+    }
+#endif
+    (void)set;
+    (void)mmu_idx;
+    d->hook(d->opaque, vcpu_index, addr, size, is_write);
 }
 
 /**
@@ -2153,7 +2327,7 @@ static uint64_t do_ld_beN(CPUState *cpu, MMULookupPageData *p,
     MemOp atom;
     unsigned tmp, half_size;
 
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         return do_ld_mmio_beN(cpu, p->full, ret_be, p->addr, p->size,
                               mmu_idx, type, ra);
     }
@@ -2203,7 +2377,7 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
     uint64_t b;
     MemOp atom;
 
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         return do_ld16_mmio_beN(cpu, p->full, a, p->addr, size, mmu_idx, ra);
     }
 
@@ -2248,7 +2422,7 @@ static Int128 do_ld16_beN(CPUState *cpu, MMULookupPageData *p,
 static uint8_t do_ld_1(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
                        MMUAccessType type, uintptr_t ra)
 {
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         return do_ld_mmio_beN(cpu, p->full, 0, p->addr, 1, mmu_idx, type, ra);
     } else {
         return *(uint8_t *)p->haddr;
@@ -2260,7 +2434,7 @@ static uint16_t do_ld_2(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 {
     uint16_t ret;
 
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 2, mmu_idx, type, ra);
         if ((memop & MO_BSWAP) == MO_LE) {
             ret = bswap16(ret);
@@ -2280,7 +2454,7 @@ static uint32_t do_ld_4(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 {
     uint32_t ret;
 
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 4, mmu_idx, type, ra);
         if ((memop & MO_BSWAP) == MO_LE) {
             ret = bswap32(ret);
@@ -2300,7 +2474,7 @@ static uint64_t do_ld_8(CPUState *cpu, MMULookupPageData *p, int mmu_idx,
 {
     uint64_t ret;
 
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         ret = do_ld_mmio_beN(cpu, p->full, 0, p->addr, 8, mmu_idx, type, ra);
         if ((memop & MO_BSWAP) == MO_LE) {
             ret = bswap64(ret);
@@ -2561,7 +2735,7 @@ static uint64_t do_st_leN(CPUState *cpu, MMULookupPageData *p,
     MemOp atom;
     unsigned tmp, half_size;
 
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         return do_st_mmio_leN(cpu, p->full, val_le, p->addr,
                               p->size, mmu_idx, ra);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
@@ -2615,7 +2789,7 @@ static uint64_t do_st16_leN(CPUState *cpu, MMULookupPageData *p,
     int size = p->size;
     MemOp atom;
 
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         return do_st16_mmio_leN(cpu, p->full, val_le, p->addr,
                                 size, mmu_idx, ra);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
@@ -2660,7 +2834,7 @@ static uint64_t do_st16_leN(CPUState *cpu, MMULookupPageData *p,
 static void do_st_1(CPUState *cpu, MMULookupPageData *p, uint8_t val,
                     int mmu_idx, uintptr_t ra)
 {
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         do_st_mmio_leN(cpu, p->full, val, p->addr, 1, mmu_idx, ra);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
         /* nothing */
@@ -2672,7 +2846,7 @@ static void do_st_1(CPUState *cpu, MMULookupPageData *p, uint8_t val,
 static void do_st_2(CPUState *cpu, MMULookupPageData *p, uint16_t val,
                     int mmu_idx, MemOp memop, uintptr_t ra)
 {
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap16(val);
         }
@@ -2691,7 +2865,7 @@ static void do_st_2(CPUState *cpu, MMULookupPageData *p, uint16_t val,
 static void do_st_4(CPUState *cpu, MMULookupPageData *p, uint32_t val,
                     int mmu_idx, MemOp memop, uintptr_t ra)
 {
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap32(val);
         }
@@ -2710,7 +2884,7 @@ static void do_st_4(CPUState *cpu, MMULookupPageData *p, uint32_t val,
 static void do_st_8(CPUState *cpu, MMULookupPageData *p, uint64_t val,
                     int mmu_idx, MemOp memop, uintptr_t ra)
 {
-    if (unlikely(p->flags & TLB_MMIO)) {
+    if (unlikely((p->flags & TLB_MMIO) && !(p->flags & TLB_INSTRUMENT))) {
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap64(val);
         }

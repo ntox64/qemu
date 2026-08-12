@@ -122,6 +122,12 @@ DEF(goto_ptr, 0, 1, 0, TCG_OPF_BB_EXIT | TCG_OPF_BB_END)
 
 DEF(plugin_cb, 0, 0, 1, TCG_OPF_NOT_PRESENT)
 DEF(plugin_mem_cb, 0, 1, 1, TCG_OPF_NOT_PRESENT)
+/*
+ * Marker for an instrumented-RAM data access: args are (addr, size,
+ * is_write, mmu_idx).  Removed by tcg_gen_inject_instrument_hooks, which
+ * replaces it with an inline TLB-gated hook call before the qemu_ld/st.
+ */
+DEF(insn_mem_hook, 0, 1, 3, TCG_OPF_NOT_PRESENT)
 
 DEF(qemu_ld, 1, 1, 1, TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)
 DEF(qemu_st, 0, 2, 1, TCG_OPF_CALL_CLOBBER | TCG_OPF_SIDE_EFFECTS | TCG_OPF_INT)

@@ -77,3 +77,27 @@ Run ``make run-percputest``.
    The private pages are plain RAM at this point and carry no latency or
    coherency model; the shared system-memory alias, firmware and low
    memory are untouched, so a PC guest still boots normally.
+
+
+Instrumented RAM
+~~~~~~~~~~~~~~~~
+
+A RAM region can register a per-access hook
+(``memory_region_register_instrument_range()``).  The translation lookaside
+buffer entry keeps its direct RAM addend, gains ``TLB_INSTRUMENT``, and
+resolves the hook from a parallel ``instr_table`` slot at fill time; the
+call itself is emitted inline at translation time, so there is no extra
+branch, no basic-block split and no disturbance to translator temporaries.
+An access can be counted and optionally delayed by a host busy-wait.
+
+This is what the node slices and ``nto64-barmem`` below use; there is no
+standalone run target.
+
+.. note::
+   Routing foreign memory through an MMIO trap region instead would also
+   count accesses, at a dispatch and a ``cpu_io_recompile`` per access -
+   tens of seconds of wall clock per firmware boot, which measures
+   nothing.  Instruction fetch is deliberately not instrumented, and the
+   exact-count gate is compiled out: the hooks are a latency model, so a
+   test should assert a minimum number of deliveries and verify completion
+   by data rather than by an exact total.
