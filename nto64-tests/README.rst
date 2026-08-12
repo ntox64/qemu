@@ -489,3 +489,21 @@ should.
    invalidation are not covered.  Guest-side walks keep their pointers in
    callee-saved registers, because the print helpers clobber
    caller-saved ones between a configuration read and its comparison.
+
+
+Enumeration and placement from the guest
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+No device is needed for these two, only a bus: ``make run-pcitest``
+enumerates, sizes each BAR by writing all-ones, picks a free hole,
+reassigns, enables memory space and confirms the device answers at the new
+address; ``make run-numapcitest`` then places a BAR near the memory its
+CPU owns and checks the assignment landed inside that window.
+
+.. note::
+   Firmware assigns BARs during POST, so the assignment protocol is only
+   visible to a guest that reassigns afterwards.  Both run at ``-smp``
+   with the per-CPU views, because a placement test on one CPU is not a
+   placement test.  Host-bridge refusals - bus number windows, an
+   above-4G prefetchable limit already programmed by firmware - are only
+   partly reachable on q35.

@@ -26,6 +26,17 @@ run-samtest: samtest
 	    -device nto64-barmem,bar64=on,bar-size=2147483648,rebar-sizes=0x3c00 \
 	    -kernel samtest -serial stdio -display none -no-reboot
 
+run-pcitest: pcitest
+	$(QEMU) -machine q35 -smp 2 -m 128 \
+	    -device nto64-barmem,bar-size=67108864 \
+	    -kernel pcitest -serial stdio -display none -no-reboot
+
+run-numapcitest: numapcitest
+	$(QEMU) -machine q35,nto64-per-cpu-ram=on -smp 2 -m 128 \
+	    -device nto64-barmem,bar-size=1048576 \
+	    -device nto64-barmem,bar-size=1048576 \
+	    -kernel numapcitest -serial stdio -display none -no-reboot
+
 
 EXTRA_BUILT +=
-RUNTARGETS += run-barmemtest run-rebartest run-samtest run-sriovtest
+RUNTARGETS += run-barmemtest run-numapcitest run-pcitest run-rebartest run-samtest run-sriovtest
