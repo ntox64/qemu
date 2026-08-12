@@ -226,3 +226,31 @@ BSP's AVX2 code (its #UD is the regression).
    enumerates one CPU type for every slot, so mixed-core ARM is a later
    QEMU problem, and the per-CPU override is the portable stand-in rather
    than an ARM test.
+
+
+Interrupts
+----------
+
+Interrupt delivery is only observable if a device-side count can be
+compared against a guest-side handler count, so every source here reports
+how many times it fired.
+
+On-demand interrupt source
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nto64-irqgen`` (PCI ``1234:1ee7``) raises an interrupt on an MMIO write
+with the delivery path selectable: legacy ``INTx`` through the PIC or the
+I/O APIC, or MSI from its own capability at configuration offset ``0x60``;
+edge or level; with an auto-repeat timer for storms.  BAR0 is the control
+region: ``0x00`` magic, ``0x04`` control (bit0 enable, bit1 edge, bit2
+msi, bit3 storm), ``0x08`` delivered count, ``0x0c`` period in
+microseconds, ``0x10`` trigger, ``0x14`` status.
+
+Run ``make run-irqtest``.
+
+.. note::
+   Without a device-side count, "the interrupt was slow" and "the
+   interrupt never arrived" are the same observation, and every interrupt
+   case in this tree depends on telling them apart.  One source per
+   device: several devices storming at once is only as interesting as the
+   I/O APIC makes it.
