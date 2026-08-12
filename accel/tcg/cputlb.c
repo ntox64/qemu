@@ -1066,7 +1066,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     hwaddr iotlb, xlat, sz, paddr_page;
     vaddr addr_page;
     int asidx, wp_flags, prot;
-    const MemoryRegionInstrumentRange *ir;
+    const InstrumentDesc *foreign_desc;
     bool is_ram, is_romd, instrumented, foreign_range;
 
     assert_cpu_is_self(cpu);
@@ -1098,8 +1098,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
 
     is_ram = memory_region_is_ram(section->mr);
     is_romd = memory_region_is_romd(section->mr);
-    ir = memory_region_instrument_range_find(paddr_page);
-    foreign_range = ir != NULL && ir->owner != cpu->cpu_index;
+    foreign_desc = memory_region_instrument_foreign_desc(paddr_page,
+                                                         cpu->cpu_index);
+    foreign_range = foreign_desc != NULL;
     /*
      * Instrumentation only ever applies to a page with host memory behind
      * it: an instrumented entry keeps the direct-RAM addend and the
@@ -1128,7 +1129,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         InstrumentDesc *idesc = section->mr->instrument_desc;
 
         if (foreign_range) {
-            idesc = (InstrumentDesc *)&ir->desc;
+            idesc = (InstrumentDesc *)foreign_desc;
         }
         full->instrument_desc = instrumented ? idesc : NULL;
     }

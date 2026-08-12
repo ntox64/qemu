@@ -21,6 +21,8 @@
 #include "cpu.h"
 #include "tcg/helper-tcg.h"
 #include "hw/qdev-core.h"
+#include "hw/sysbus.h"
+#include "hw/boards.h"
 #include "qapi/error.h"
 
 #include "system/system.h"
@@ -83,30 +85,76 @@ bool tcg_cpu_realizefn(CPUState *cs, Error **errp)
 
     /*
      * nto64-per-cpu-ram: give this vCPU its own address space whose
-     * root is the full system memory plus a private per-CPU RAM page.
-     * The per-CPU views union into the same real RAM; each CPU only
-     * sees its own private window (testbed for per-CPU memory).
+     * root is the full system memory, plus the interconnect window:
+     * every window page is the remote (trap) region except the CPU's
+     * own page, which is direct RAM.  Cross-CPU traffic goes through
+     * nto64-remote (write-behind, stale reads).
      */
     if (object_property_get_bool(OBJECT(qdev_get_machine()),
                                  "nto64-per-cpu-ram", NULL)) {
+        Object *robj = object_resolve_path("/machine/nto64-remote", NULL);
+        DeviceState *rdev;
+        MemoryRegion *remote_mmio, *local_ram;
         MemoryRegion *cpu_ram_root = g_new(MemoryRegion, 1);
-        MemoryRegion *cpu_ram_sysmem = g_new(MemoryRegion, 1);
-        MemoryRegion *cpu_ram_priv = g_new(MemoryRegion, 1);
-        char *priv_name = g_strdup_printf("cpu-ram-private-%d",
-                                          cs->cpu_index);
+        MemoryRegion *sysmem_alias = g_new(MemoryRegion, 1);
+        MemoryRegion *remote_alias = g_new(MemoryRegion, 1);
+        MemoryRegion *own_alias = g_new(MemoryRegion, 1);
+        uint64_t window;
+        uint64_t base = object_property_get_uint(
+            OBJECT(qdev_get_machine()), "nto64-per-cpu-ram-base", NULL);
+
+        if (!base) {
+            base = NTO64_PERCPU_RAM_BASE;
+        }
+
+        g_assert(robj);
+        rdev = DEVICE(robj);
+        remote_mmio = sysbus_mmio_get_region(SYS_BUS_DEVICE(rdev), 0);
+        local_ram = sysbus_mmio_get_region(SYS_BUS_DEVICE(rdev), 1);
+        window = memory_region_size(remote_mmio);
 
         memory_region_init(cpu_ram_root, OBJECT(cpu), "cpu-ram", ~0ull);
-        memory_region_init_alias(cpu_ram_sysmem, OBJECT(cpu),
+        memory_region_init_alias(sysmem_alias, OBJECT(cpu),
                                  "cpu-ram-sysmem", get_system_memory(),
                                  0, ~0ull);
-        memory_region_add_subregion(cpu_ram_root, 0, cpu_ram_sysmem);
-        memory_region_init_ram(cpu_ram_priv, OBJECT(cpu),
-                               priv_name, 0x1000, &error_abort);
-        g_free(priv_name);
+        memory_region_add_subregion(cpu_ram_root, 0, sysmem_alias);
+        memory_region_init_alias(remote_alias, OBJECT(cpu),
+                                 "cpu-ram-remote", remote_mmio, 0, window);
+        memory_region_add_subregion_overlap(cpu_ram_root,
+                                            base,
+                                            remote_alias, 1);
+        memory_region_init_alias(own_alias, OBJECT(cpu), "cpu-ram-own",
+                                 local_ram, cs->cpu_index * 0x1000, 0x1000);
         memory_region_add_subregion_overlap(
             cpu_ram_root,
-            NTO64_PERCPU_RAM_BASE + cs->cpu_index * 0x1000,
-            cpu_ram_priv, 1);
+            base + cs->cpu_index * 0x1000,
+            own_alias, 2);
+
+        /*
+         * whole-RAM node slices: the RAM range [0, ram_size) is
+         * partitioned per vCPU - the OWN slice needs no overlay (the
+         * sysmem alias already maps it as direct RAM with the firmware
+         * ROM/VGA shadows intact; low/BIOS memory is node 0's slice,
+         * like real machines).  Every FOREIGN slice is instrumented via
+         * the per-node instrument-RANGE table (registered by
+         * nto64-remote), resolved by physical address at TLB fill, so
+         * no plain-RAM path reaches another node's slice and every
+         * foreign access pays the hook.  No slice subregion is added to
+         * the per-CPU roots: aliasing the system memory at the same
+         * range would give OVMF's PAM/ROM map updates two paths to the
+         * same RAM and the resulting flatview churn corrupts the DXE
+         * runtime (wild fetches; see HANDOVER  amend).
+         */
+        {
+            MachineState *ms = MACHINE(qdev_get_machine());
+            uint64_t ram_size = ms->ram_size;
+            uint32_t nslices = ms->smp.max_cpus;
+            uint64_t slice_size = nslices ? ram_size / nslices : 0;
+
+            if (slice_size && ram_size % nslices == 0) {
+                /* Instrumentation only (range table); see above. */
+            }
+        }
         cs->memory = cpu_ram_root;
     }
 

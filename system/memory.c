@@ -67,6 +67,24 @@ void memory_region_set_instrumented(MemoryRegion *mr,
 
 static GArray *instrument_ranges;
 
+/*
+ * Node of every possible vCPU, indexed by cpu_index: the ranges carry a
+ * node id (they are per node/slice), while TLB fill asks about a vCPU,
+ * and the two differ as soon as a node holds more than one vCPU.  The
+ * machine fills this before the vCPUs start.
+ */
+static int *instrument_cpu_nodes;
+static int instrument_cpu_nodes_n;
+
+void memory_region_register_instrument_cpu_nodes(const int *node_of_cpu,
+                                                 int count)
+{
+    g_free(instrument_cpu_nodes);
+    instrument_cpu_nodes = g_new(int, count);
+    memcpy(instrument_cpu_nodes, node_of_cpu, count * sizeof(int));
+    instrument_cpu_nodes_n = count;
+}
+
 void memory_region_register_instrument_range(hwaddr base, hwaddr size,
                                              int owner,
                                              MemoryRegionInstrumentHook hook,
@@ -89,22 +107,40 @@ void memory_region_register_instrument_range(hwaddr base, hwaddr size,
 #endif
 }
 
-const MemoryRegionInstrumentRange *memory_region_instrument_range_find(
-    hwaddr addr)
+const InstrumentDesc *memory_region_instrument_foreign_desc(hwaddr addr,
+                                                            int cpu_index)
 {
     MemoryRegionInstrumentRange *r;
+    const InstrumentDesc *desc = NULL;
     unsigned int i;
+    int local;
 
     if (!instrument_ranges) {
         return NULL;
     }
+    /*
+     * The node of the accessing vCPU is what makes a range local;
+     * without a node for it (a machine that never registered the
+     * mapping) fall back to the vCPU-index identity the ranges used
+     * before they were made per node.
+     */
+    local = (cpu_index >= 0 && cpu_index < instrument_cpu_nodes_n &&
+             instrument_cpu_nodes[cpu_index] >= 0)
+            ? instrument_cpu_nodes[cpu_index] : cpu_index;
     for (i = 0; i < instrument_ranges->len; i++) {
         r = &g_array_index(instrument_ranges, MemoryRegionInstrumentRange, i);
-        if (addr >= r->base && addr < r->base + r->size) {
-            return r;
+        if (addr < r->base || addr >= r->base + r->size) {
+            continue;
+        }
+        if (r->owner == local) {
+            /* the vCPU's own slice: direct RAM, no instrumentation */
+            return NULL;
+        }
+        if (!desc) {
+            desc = &r->desc;
         }
     }
-    return NULL;
+    return desc;
 }
 
 static unsigned memory_region_transaction_depth;

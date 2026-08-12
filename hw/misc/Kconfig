@@ -30,6 +30,10 @@ config EDU
     default y if TEST_DEVICES
     depends on PCI && MSI_NONBROKEN
 
+config NTO64_REMOTE
+    bool
+    default y
+
 config I2C_ECHO
     bool
     default y if TEST_DEVICES

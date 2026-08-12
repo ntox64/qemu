@@ -184,6 +184,7 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     }
 
     pc_machine_init_sgx_epc(pcms);
+    pc_nto64_remote_create(pcms);
     x86_cpus_init(x86ms, pcmc->default_cpu_version);
 
     if (kvm_enabled()) {
@@ -285,6 +286,7 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     }
 
     ioapic_init_gsi(gsi_state, phb);
+    pc_nto64_remote_connect_irq(pcms);
 
     if (tcg_enabled()) {
         x86_register_ferr_irq(x86ms->gsi[13]);

@@ -104,8 +104,12 @@ typedef struct InstrumentDesc {
  * aliases of the machine RAM (one ram_addr identity, so TCG code
  * invalidation stays coherent), and the per-node instrumentation is
  * resolved by physical range at TLB fill instead of via a separate
- * MemoryRegion.  @owner is the vCPU index that owns the range (direct,
- * un-instrumented for it; instrumented for every other vCPU).
+ * MemoryRegion.  @owner is the NUMA node (slice index) that owns the
+ * range: a vCPU of that node reaches it as plain direct RAM, every
+ * other vCPU sees it through the hook.  A range is per node, not per
+ * vCPU, so the vCPU's node is registered separately and compared at
+ * TLB fill - the vCPU index and the node id are the same number only
+ * in the one-node-per-vCPU shape.
  */
 typedef struct MemoryRegionInstrumentRange {
     hwaddr base;
@@ -118,8 +122,23 @@ void memory_region_register_instrument_range(hwaddr base, hwaddr size,
                                              int owner,
                                              MemoryRegionInstrumentHook hook,
                                              void *opaque);
-const MemoryRegionInstrumentRange *memory_region_instrument_range_find(
-    hwaddr addr);
+
+/*
+ * Node of every possible vCPU, indexed by cpu_index (-1 = unknown).
+ * Registered by the machine before the vCPUs run, so the range lookup
+ * can tell a local slice from a foreign one.
+ */
+void memory_region_register_instrument_cpu_nodes(const int *node_of_cpu,
+                                                 int count);
+
+/*
+ * Descriptor the vCPU @cpu_index has to use for @addr: NULL when @addr
+ * lies in no registered range, or in a range owned by that vCPU's own
+ * node (its own slice stays direct RAM); otherwise the descriptor of
+ * the range, i.e. the access crosses a node boundary.
+ */
+const InstrumentDesc *memory_region_instrument_foreign_desc(hwaddr addr,
+                                                            int cpu_index);
 
 /*
  * Mark @mr as instrumented RAM: TCG routes data loads/stores to it

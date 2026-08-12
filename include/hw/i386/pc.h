@@ -50,6 +50,7 @@ typedef struct PCMachineState {
     bool hpet_enabled;
     bool i8042_enabled;
     bool nto64_per_cpu_ram;
+    uint64_t nto64_per_cpu_ram_base;
     bool default_bus_bypass_iommu;
     bool fd_bootchk;
     uint64_t max_fw_size;
@@ -196,6 +197,9 @@ void pc_basic_device_init(struct PCMachineState *pcms,
                           bool create_fdctrl,
                           uint32_t hpet_irqs);
 void pc_nic_init(PCMachineClass *pcmc, ISABus *isa_bus, PCIBus *pci_bus);
+
+void pc_nto64_remote_create(PCMachineState *pcms);
+void pc_nto64_remote_connect_irq(PCMachineState *pcms);
 
 void pc_i8259_create(ISABus *isa_bus, qemu_irq *i8259_irqs);
 

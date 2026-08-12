@@ -26,6 +26,7 @@
 #include "qemu/units.h"
 #include "exec/target_page.h"
 #include "hw/i386/pc.h"
+#include "hw/sysbus.h"
 #include "hw/char/serial-isa.h"
 #include "hw/char/parallel.h"
 #include "hw/hyperv/hv-balloon.h"
@@ -1560,6 +1561,27 @@ static void pc_machine_set_nto64_per_cpu_ram(Object *obj, bool value,
     pcms->nto64_per_cpu_ram = value;
 }
 
+static void pc_machine_get_nto64_per_cpu_ram_base(Object *obj, Visitor *v,
+                                                  const char *name,
+                                                  void *opaque,
+                                                  Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+    uint64_t value = pcms->nto64_per_cpu_ram_base;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void pc_machine_set_nto64_per_cpu_ram_base(Object *obj, Visitor *v,
+                                                  const char *name,
+                                                  void *opaque,
+                                                  Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    visit_type_uint64(v, name, &pcms->nto64_per_cpu_ram_base, errp);
+}
+
 static bool pc_machine_get_i8042(Object *obj, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
@@ -1572,6 +1594,64 @@ static void pc_machine_set_i8042(Object *obj, bool value, Error **errp)
     PCMachineState *pcms = PC_MACHINE(obj);
 
     pcms->i8042_enabled = value;
+}
+
+/*
+ * nto64-per-cpu-ram: create the cross-CPU interconnect device (the
+ * remote-memory class for the per-CPU views) and map its control
+ * MMIO at a fixed low-4G hole.  Must run before x86_cpus_init so the
+ * per-CPU AS roots can resolve it.
+ */
+void pc_nto64_remote_create(PCMachineState *pcms)
+{
+    DeviceState *dev;
+    MachineState *ms = MACHINE(pcms);
+    uint64_t base;
+
+    if (!pcms->nto64_per_cpu_ram) {
+        return;
+    }
+    base = pcms->nto64_per_cpu_ram_base;
+    if (!base) {
+        base = 0xDF000000u;     /* default low-4G hole */
+        pcms->nto64_per_cpu_ram_base = base;
+    }
+    if (ms->ram_size % ms->smp.max_cpus) {
+        error_report("nto64-per-cpu-ram: ram size %" PRIu64
+                     " must divide evenly across %u CPUs",
+                     ms->ram_size, ms->smp.max_cpus);
+        exit(EXIT_FAILURE);
+    }
+    dev = qdev_new("nto64-remote");
+    object_property_add_child(OBJECT(pcms), "nto64-remote", OBJECT(dev));
+    qdev_prop_set_uint64(dev, "window-size",
+                         (uint64_t)ms->smp.max_cpus * 0x1000);
+    /*
+     * whole-RAM node slices: one per vCPU, evenly split RAM - low
+     * memory (BIOS/firmware area) is simply node 0's slice, like real
+     * machines.  Each CPU root overlays its own slice as direct RAM
+     * and every other slice as a coherent interconnect trap
+     * (hardware-NUMA / software-UMA).
+     */
+    qdev_prop_set_uint64(dev, "slice-size",
+                         ms->ram_size / ms->smp.max_cpus);
+    qdev_prop_set_uint32(dev, "slices", ms->smp.max_cpus);
+    sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
+    memory_region_add_subregion(get_system_memory(), base + 0x100000u,
+                                sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 2));
+}
+
+/* Wire the interconnect's commit-complete IRQ to ISA/IOAPIC line 9. */
+void pc_nto64_remote_connect_irq(PCMachineState *pcms)
+{
+    Object *robj;
+
+    if (!pcms->nto64_per_cpu_ram) {
+        return;
+    }
+    robj = object_resolve_path("/machine/nto64-remote", NULL);
+    g_assert(robj);
+    sysbus_connect_irq(SYS_BUS_DEVICE(robj), 0, X86_MACHINE(pcms)->gsi[9]);
 }
 
 static bool pc_machine_get_default_bus_bypass_iommu(Object *obj, Error **errp)
@@ -1817,6 +1897,13 @@ static void pc_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "nto64-per-cpu-ram",
         "Give every vCPU its own address-space view with a private "
         "per-CPU RAM window (testbed for per-CPU memory)");
+
+
+    object_class_property_add(oc, "nto64-per-cpu-ram-base", "size",
+        pc_machine_get_nto64_per_cpu_ram_base,
+        pc_machine_set_nto64_per_cpu_ram_base, NULL, NULL);
+    object_class_property_set_description(oc, "nto64-per-cpu-ram-base",
+        "Base address of the per-CPU RAM window (default 0xDF000000)");
 
     object_class_property_add_bool(oc, PC_MACHINE_I8042,
         pc_machine_get_i8042, pc_machine_set_i8042);

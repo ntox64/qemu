@@ -34,7 +34,37 @@ _start:
     movl 0xdf001000, %eax
     movl %eax, other_save
 
-    movl $ok_msg, %esi
+    /* whole-RAM slice (cpu 1's slice: 0x04000000 with -m 128 -smp 2):
+     * coherent from here either way - direct RAM by default, a
+     * counted trap with nto64-node-trap=on */
+    movl $0xdeadbeef, 0x04000000
+    movl 0x04000000, %eax
+    movl %eax, slice_save
+    movl 0xdf100028, %eax
+    movl %eax, srd_save
+    movl 0xdf10002c, %eax
+    movl %eax, swr_save
+
+    /* verify the observations: a per-CPU isolation result, not a
+     * blind "OK" (shared alias, own window, foreign window, slice). */
+    cmpl $0x12345678, sys_save
+    je chk_sys_ok
+    incl fail
+chk_sys_ok:
+    cmpl $0xcafebabe, own_save
+    je chk_own_ok
+    incl fail
+chk_own_ok:
+    cmpl $0xcafebabe, other_save   /* another CPU's window must NOT
+                                    * hold our marker */
+    jne chk_other_ok
+    incl fail
+chk_other_ok:
+    cmpl $0xdeadbeef, slice_save
+    je chk_slice_ok
+    incl fail
+chk_slice_ok:
+    movl $msg, %esi
     call puts
     movl sys_save, %eax
     call puthex
@@ -45,6 +75,22 @@ _start:
     movl $spc_other, %esi
     call puts
     movl other_save, %eax
+    call puthex
+    movl $spc_slice, %esi
+    call puts
+    movl slice_save, %eax
+    call puthex
+    movl $spc_srd, %esi
+    call puts
+    movl srd_save, %eax
+    call puthex
+    movl $spc_swr, %esi
+    call puts
+    movl swr_save, %eax
+    call puthex
+    movl $sp_f, %esi
+    call puts
+    movl fail, %eax
     call puthex
     movl $nl, %esi
     call puts
@@ -101,9 +147,17 @@ halt:
 sys_save:   .long 0
 own_save:   .long 0
 other_save: .long 0
+slice_save: .long 0
+srd_save:   .long 0
+swr_save:   .long 0
+fail:       .long 0
 
     .section .rodata
-ok_msg:   .asciz "PERCPU OK sys="
+msg:      .asciz "PERCPU sys="
 spc_own:  .asciz " own="
 spc_other: .asciz " other="
+spc_slice: .asciz " slice="
+spc_srd:   .asciz " srd="
+spc_swr:   .asciz " swr="
+sp_f:     .asciz " fail="
 nl:       .asciz "\n"

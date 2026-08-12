@@ -101,3 +101,46 @@ standalone run target.
    exact-count gate is compiled out: the hooks are a latency model, so a
    test should assert a minimum number of deliveries and verify completion
    by data rather than by an exact total.
+
+
+Node slices and the interconnect
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Machine RAM is partitioned into one slice per node, with
+``nto64-numa-cores-per-node`` vCPUs per node (default one).  The
+``nto64-remote`` device owns the window: a foreign slice is reached
+through the trap region and is write-behind, so a read immediately after a
+remote write returns the previous value, while the node's own page stays
+direct RAM.  The ``ccnuma`` control bit makes shared RAM coherent by
+construction instead, which is the split a real machine draws between
+cache-coherent cross-node traffic and device or peer memory.  Per-node
+counters and a configurable ``slice-delay-ns`` sit on the instrumentation
+above.
+
+The device is a sysbus device at ``/machine/nto64-remote`` with regions
+0 (window), 1 (direct RAM) and 2 (control); the commit-complete interrupt
+is wired to ISA line 9.
+
+.. code-block:: text
+
+  ctrl offset  meaning
+  0x00         magic
+  0x04/0x08    commit delay / jitter, ns
+  0x0c         control: bit0 bypass, bit1 write-through,
+               bit2 irq-on-commit, bit4 ccnuma
+  0x10-0x1c    reads, writes, commits, pending
+  0x20         interrupt status (write to clear)
+  0x24         last commit latency
+  0x28/0x2c    slice read / write counters
+  0x3c         slice delay, ns
+
+Run ``make run-slicecount`` for the counters and the delay gate, and ``make run-efiremotetest`` to touch a foreign
+CPU's memory from a long-mode EFI application with the secondary CPUs
+brought up through ``INIT``/``SIPI``.
+
+.. note::
+   The delay is a host busy-wait, so it models relative timing rather
+   than bandwidth.  Write-behind is not a coherence protocol: there is no
+   snooping, ownership or partial-line state to corrupt.  The EFI case
+   exists because it is the only way to exercise the window while
+   firmware, and not our own boot code, owns the page tables.
