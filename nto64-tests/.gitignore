@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: BSD-2-Clause
+
+# The .S sources, rules/*.mk and the data files are the input; everything
+# they build (extension-less kernels, ELF/FAT images, disassembly) is
+# disposable.  Whitelist sources instead of listing outputs by hand, so a
+# new test never has to touch this file.
+*
+!*/
+!*.S
+!*.c
+!*.py
+!*.mk
+!*.rst
+!*.conf
+!Makefile
+!.gitignore
