@@ -421,3 +421,30 @@ distinguishable from a non-fatal one in the log a driver would print.
    Reaching the capability at all is part of the test: ``CF8``/``CFC``
    only addresses the first 256 bytes and wraps above that, so anything
    from ``0x100`` on has to go through ECAM.
+
+
+PCI BARs
+--------
+
+Big-BAR device memory
+~~~~~~~~~~~~~~~~~~~~~
+
+``nto64-barmem`` (PCI ``1234:beef``) is the device class at the end of
+the hierarchy: BAR0 is a large memory region backed by a host memory
+backend, switchable between a RAM fast path and trapped MMIO, and BAR1
+carries the controls - ``0x00`` magic, ``0x04`` doorbell, ``0x08`` size,
+``0x0c`` mode/irq, ``0x10`` interrupt count, ``0x14``/``0x18`` BAR access
+counters and ``0x1c`` BAR delay.  The fast path is instrumented, so a BAR
+touch counts and delays exactly like a foreign-node RAM access.
+
+Run ``make run-barmemtest``.
+
+.. note::
+   A doorbell that raises ``INTx`` or MSI is what proves a write landed
+   where the interrupt claims it did.  Aliasing a memory backend is not a
+   device with a queue, a doorbell FIFO or write-combining behaviour, and
+   the delays are relative rather than host-speed.  One layout rule is
+   enforced here because it is easy to get wrong: a 64-bit BAR0 must be
+   followed by region 2, since ``pci_bar()`` places region *N* at
+   ``0x10 + N*4`` and a region-1 control BAR clobbers BAR0's high write
+   mask.
