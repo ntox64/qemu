@@ -359,3 +359,23 @@ the IOMMU against the bypassing path of the node-bound device.
    remapping, no queued invalidation, no PASID.  The contrast between the
    two roots is the point - it is the only way a test can show which path
    a transfer actually took.
+
+
+Peer-to-peer DMA
+~~~~~~~~~~~~~~~~
+
+With ``peer=<dev>`` and ``peer-bar=<n>``, control bit3 selects peer mode
+and bit4 the direction, and the ring flags mark an entry's source or
+destination as the peer.  The peer's BAR becomes an address space, so a
+transfer moves RAM to device BAR, device BAR to RAM, or within the BAR,
+with neither a CPU nor guest RAM in the middle.  Separate peer counters
+(``0x68``, ``0x6c``, ``0x70``) record what went through the link.
+
+Run ``make run-p2ptest`` with two endpoints on one bus.
+
+.. note::
+   Fabric behaviour around a peer transaction - relaxed ordering, ACS, an
+   IOMMU's peer window rules - is not modelled, since both endpoints hang
+   off the same root bus.  What is covered is the failure a driver
+   actually sees: a BAR mapped into another BAR reading back zeros
+   without an error.

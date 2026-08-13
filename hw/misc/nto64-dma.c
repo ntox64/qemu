@@ -36,13 +36,36 @@
  *     0x58 per-queue descriptors processed
  *     0x5c per-queue transfers completed
  *     0x60/0x64 per-queue bytes moved
+ *     0x68 peer-P2P transfers completed (P2P mode, read-only)
+ *     0x6c peer-P2P bytes moved low, 0x70 high (read-only)
  *
  * The 0x28-0x38 ring registers alias queue 0, so the legacy single-ring
  * mode (control bit2 + start) is the "queue 0" case.
  *
+ * PCIe peer-to-peer (P2P): with the `peer` property set
+ * another PCI device (e.g. nto64-barmem) and control bit3 (P2P) set,
+ * the bulk engine's transfer target is that peer's BAR instead of
+ * system memory - the CPU never touches the moved bytes (the OS only
+ * set up src/dst + the descriptor rings).  Direction:
+ *     bit3=1, bit4=0: device AS -> peer BAR   (src read via the DMA
+ *                       AS, dst is an offset into the peer BAR)
+ *     bit3=1, bit4=1: peer BAR -> device AS   (src is an offset into
+ *                       the peer BAR, dst written via the DMA AS)
+ * P2P transfers are counted separately in 0x68/0x6c/0x70.
+ * `peer-bar` (default 0) selects the peer's BAR to target; it must be
+ * a memory BAR.  The peer device must appear before nto64-dma on the
+ * command line (QEMU realizes -device options in order).
+ *
  * Ring descriptors (stride bytes, 32-bit little-endian):
  *     +0 source address, +4 dest address, +8 length,
- *     +0xc flags (bit0 valid; the device ORs bit1 on completion).
+ *     +0xc flags (bit0 valid; the device ORs bit1 on completion;
+ *     bit2 = peer dest (dst is an offset into the peer BAR),
+ *     bit3 = peer src (src is an offset into the peer BAR) - the
+ *     device-side address of that descriptor goes through the bound
+ *     queue's AS, the peer side through the peer BAR AS, so a
+ *     descriptor with both bits set relocates data within device
+ *     memory with no CPU involvement).
+ *
  * The ring mode walks the descriptors one small transfer at a time,
  * firing the completion MSI-X per message (NIC/RDMA-style); the bulk
  * mode does one chunked transfer of up to max-xfer bytes
@@ -85,6 +108,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(Nto64DmaState, NTO64_DMA)
 #define NTO64_DMA_CTRL_START 0x1
 #define NTO64_DMA_CTRL_IRQ   0x2
 #define NTO64_DMA_CTRL_RING  0x4
+#define NTO64_DMA_CTRL_P2P   0x8     /* bulk target is the peer BAR */
+#define NTO64_DMA_CTRL_P2PREV 0x10   /* P2P direction: peer -> device */
+
+#define NTO64_DMA_DESC_PEER_DST 0x4  /* ring dst is a peer BAR offset */
+#define NTO64_DMA_DESC_PEER_SRC 0x8  /* ring src is a peer BAR offset */
 
 #define NTO64_DMA_ST_BUSY 0x1
 #define NTO64_DMA_ST_DONE 0x2
@@ -107,6 +135,8 @@ typedef struct Nto64DmaState {
     uint64_t bulk_src, bulk_dst;  /* snapshot of the in-flight bulk op */
     uint32_t bulk_len;            /* total bytes of the bulk op */
     uint64_t bulk_off;            /* bytes moved so far */
+    bool bulk_p2p;                /* bulk target is the peer BAR */
+    bool bulk_rev;                /* P2P direction: peer -> device */
     uint8_t *bounce;              /* shared 1 MiB chunk buffer */
     uint32_t queues_n;        /* `queues` property (MSI-X vectors too) */
     struct Nto64DmaQueue *queues;
@@ -117,6 +147,12 @@ typedef struct Nto64DmaState {
      * DMA through the PCI/IOMMU AS instead of the vCPU (node) memory view
      */
     bool iommu;
+    PCIDevice *peer;          /* `peer` property: P2P target device */
+    uint32_t peer_bar;        /* `peer-bar` property: BAR on the peer */
+    MemoryRegion *peer_mr;    /* resolved peer BAR memory region */
+    AddressSpace peer_as;     /* AS rooted at the peer BAR (P2P side) */
+    uint32_t p2p_xfers;       /* P2P transfers completed */
+    uint64_t p2p_bytes;       /* P2P bytes moved */
     QEMUBH *bh;
 } Nto64DmaState;
 
@@ -135,9 +171,10 @@ typedef struct Nto64DmaQueue {
     uint64_t bytes;
 } Nto64DmaQueue;
 
-/* Chunked copy of len bytes from src to dst through @as. */
-static bool nto64_dma_copy_as(AddressSpace *as, hwaddr src, hwaddr dst,
-                              uint32_t len, uint8_t *buf)
+/* Chunked copy of len bytes from src (src_as) to dst (dst_as). */
+static bool nto64_dma_copy2(AddressSpace *src_as, AddressSpace *dst_as,
+                            hwaddr src, hwaddr dst, uint32_t len,
+                            uint8_t *buf)
 {
     uint64_t off;
 
@@ -145,15 +182,64 @@ static bool nto64_dma_copy_as(AddressSpace *as, hwaddr src, hwaddr dst,
         uint32_t chunk = MIN(NTO64_DMA_CHUNK, len - off);
         MemTxResult r1, r2;
 
-        r1 = address_space_rw(as, src + off,
+        r1 = address_space_rw(src_as, src + off,
                               MEMTXATTRS_UNSPECIFIED, buf, chunk, false);
-        r2 = address_space_rw(as, dst + off,
+        r2 = address_space_rw(dst_as, dst + off,
                               MEMTXATTRS_UNSPECIFIED, buf, chunk, true);
         if (r1 != MEMTX_OK || r2 != MEMTX_OK) {
             return false;
         }
     }
     return true;
+}
+
+/* Chunked copy of len bytes from src to dst through one @as. */
+static bool nto64_dma_copy_as(AddressSpace *as, hwaddr src, hwaddr dst,
+                              uint32_t len, uint8_t *buf)
+{
+    return nto64_dma_copy2(as, as, src, dst, len, buf);
+}
+
+/*
+ * One transfer, with optional peer-BAR endpoints (P2P):
+ * a peer endpoint address is an offset into the peer BAR resolved in
+ * realize (`peer` + `peer-bar`); the other endpoint goes through the
+ * caller's address space (the bulk engine's AS or a queue's AS).
+ */
+static bool nto64_dma_xfer(Nto64DmaState *s, AddressSpace *dev_as,
+                           hwaddr src, hwaddr dst, uint32_t len,
+                           bool src_peer, bool dst_peer, uint8_t *buf)
+{
+    AddressSpace *src_as = src_peer ? &s->peer_as : dev_as;
+    AddressSpace *dst_as = dst_peer ? &s->peer_as : dev_as;
+
+    /*
+     * A ring descriptor may name either endpoint as a peer BAR offset
+     * even when the device has no `peer` (s->peer_mr stays NULL and
+     * the peer address space is never initialised).  That is a
+     * guest/descriptor error - fail the transfer like the bulk P2P
+     * path does instead of walking an uninitialised address space.
+     */
+    if ((src_peer || dst_peer) && !s->peer_mr) {
+        return false;
+    }
+    return nto64_dma_copy2(src_as, dst_as, src, dst, len, buf);
+}
+
+/*
+ * Bulk-mode P2P copy: direction from control bit4.  Returns false if
+ * no peer is configured or the copy fails.
+ */
+static bool nto64_dma_copy_peer(Nto64DmaState *s, hwaddr src, hwaddr dst,
+                                uint32_t len)
+{
+    bool rev = s->control & NTO64_DMA_CTRL_P2PREV;
+
+    if (!s->peer_mr) {
+        return false;
+    }
+    return nto64_dma_xfer(s, &s->dma_as, src, dst, len,
+                          rev, !rev, s->bounce);
 }
 
 /* One ring descriptor: +0 src, +4 dst, +8 len, +0xc flags. */
@@ -188,7 +274,10 @@ static void nto64_dma_ring_q(Nto64DmaState *s, unsigned q)
             break;
         }
         if (d.len > s->max_xfer ||
-            !nto64_dma_copy_as(&qq->as, d.src, d.dst, d.len, s->bounce)) {
+            !nto64_dma_xfer(s, &qq->as, d.src, d.dst, d.len,
+                            !!(d.flags & NTO64_DMA_DESC_PEER_SRC),
+                            !!(d.flags & NTO64_DMA_DESC_PEER_DST),
+                            s->bounce)) {
             s->status = NTO64_DMA_ST_ERR;
             return;
         }
@@ -198,6 +287,10 @@ static void nto64_dma_ring_q(Nto64DmaState *s, unsigned q)
                                 4) != MEMTX_OK) {
             s->status = NTO64_DMA_ST_ERR;
             return;
+        }
+        if (d.flags & (NTO64_DMA_DESC_PEER_SRC | NTO64_DMA_DESC_PEER_DST)) {
+            s->p2p_xfers++;
+            s->p2p_bytes += d.len;
         }
         qq->xfers++;
         qq->bytes += d.len;
@@ -216,6 +309,8 @@ static void nto64_dma_bulk_begin(Nto64DmaState *s)
     s->bulk_src = s->src;
     s->bulk_dst = s->dst;
     s->bulk_off = 0;
+    s->bulk_p2p = !!(s->control & NTO64_DMA_CTRL_P2P);
+    s->bulk_rev = !!(s->control & NTO64_DMA_CTRL_P2PREV);
 }
 
 /*
@@ -261,7 +356,13 @@ static void nto64_dma_bh(void *opaque)
         hwaddr src = s->bulk_src + s->bulk_off;
         hwaddr dst = s->bulk_dst + s->bulk_off;
 
-        if (!nto64_dma_copy_as(&s->dma_as, src, dst, chunk, s->bounce)) {
+        if (s->bulk_p2p) {
+            if (!nto64_dma_copy_peer(s, src, dst, chunk)) {
+                s->status = NTO64_DMA_ST_ERR;
+                return;
+            }
+        } else if (!nto64_dma_copy_as(&s->dma_as, src, dst, chunk,
+                                      s->bounce)) {
             s->status = NTO64_DMA_ST_ERR;
             return;
         }
@@ -275,6 +376,22 @@ static void nto64_dma_bh(void *opaque)
          * vCPUs under mttcg) and continue on the next BH slice.
          */
         qemu_bh_schedule(s->bh);
+        return;
+    }
+
+    if (s->bulk_p2p) {
+        s->p2p_xfers++;
+        s->p2p_bytes += s->bulk_len;
+        s->xfers++;
+        s->bytes += s->bulk_len;
+        s->status = NTO64_DMA_ST_DONE;
+        if (s->control & NTO64_DMA_CTRL_IRQ) {
+            msix_notify(&s->pdev, 0);
+        }
+        info_report("nto64-dma: p2p %s %u bytes (%" PRIx64
+                    " -> peer +%" PRIx64 ")",
+                    s->bulk_rev ? "in" : "out",
+                    s->bulk_len, s->bulk_src, s->bulk_dst);
         return;
     }
 
@@ -382,6 +499,12 @@ static uint64_t nto64_dma_read(void *opaque, hwaddr addr, unsigned size)
     case 0x64:
         qq = &s->queues[s->qselect];
         return (uint32_t)(qq->bytes >> 32);
+    case 0x68:
+        return s->p2p_xfers;
+    case 0x6c:
+        return (uint32_t)s->p2p_bytes;
+    case 0x70:
+        return (uint32_t)(s->p2p_bytes >> 32);
     default:
         return 0;
     }
@@ -398,7 +521,9 @@ static void nto64_dma_write(void *opaque, hwaddr addr,
     case 0x04:
         s->control = (uint32_t)val & (NTO64_DMA_CTRL_START |
                                       NTO64_DMA_CTRL_IRQ |
-                                      NTO64_DMA_CTRL_RING);
+                                      NTO64_DMA_CTRL_RING |
+                                      NTO64_DMA_CTRL_P2P |
+                                      NTO64_DMA_CTRL_P2PREV);
         if (s->control & NTO64_DMA_CTRL_START) {
             nto64_dma_start(s);
         }
@@ -512,6 +637,21 @@ static void nto64_dma_realize(PCIDevice *pci_dev, Error **errp)
         s->dma_root = cpu->memory;
     }
     address_space_init(&s->dma_as, s->dma_root, "nto64-dma-as");
+    if (s->peer) {
+        if (s->peer_bar >= PCI_NUM_REGIONS ||
+            !s->peer->io_regions[s->peer_bar].memory ||
+            (s->peer->io_regions[s->peer_bar].type &
+             PCI_BASE_ADDRESS_SPACE_IO)) {
+            error_setg(errp, "nto64-dma: peer BAR %u is not a memory BAR",
+                       s->peer_bar);
+            return;
+        }
+        s->peer_mr = s->peer->io_regions[s->peer_bar].memory;
+        address_space_init(&s->peer_as, s->peer_mr, "nto64-dma-peer-as");
+        info_report("nto64-dma: P2P peer %s BAR %u",
+                    object_get_canonical_path_component(OBJECT(s->peer)),
+                    s->peer_bar);
+    }
     s->queues = g_new0(Nto64DmaQueue, s->queues_n);
     for (i = 0; i < s->queues_n; i++) {
         Nto64DmaQueue *qq = &s->queues[i];
@@ -574,6 +714,9 @@ static void nto64_dma_exit(PCIDevice *pci_dev)
     g_free(s->bounce);
     s->bounce = NULL;
     address_space_destroy(&s->dma_as);
+    if (s->peer_mr) {
+        address_space_destroy(&s->peer_as);
+    }
     for (i = 0; i < s->queues_n; i++) {
         address_space_destroy(&s->queues[i].as);
     }
@@ -588,6 +731,9 @@ static const Property nto64_dma_props[] = {
     DEFINE_PROP_UINT32("queues", Nto64DmaState, queues_n,
                        NTO64_DMA_QUEUES_DEFAULT),
     DEFINE_PROP_BOOL("iommu", Nto64DmaState, iommu, false),
+    DEFINE_PROP_LINK("peer", Nto64DmaState, peer, TYPE_PCI_DEVICE,
+                     PCIDevice *),
+    DEFINE_PROP_UINT32("peer-bar", Nto64DmaState, peer_bar, 0),
 };
 
 static void nto64_dma_class_init(ObjectClass *klass, const void *data)
