@@ -129,6 +129,38 @@ run-cxltest: cxltest
 	    -device cxl-type3,bus=root_port0,volatile-memdev=cxlmem0,id=cxl0 \
 	    -kernel cxltest -serial stdio -display none -no-reboot
 
+cpuidtest: cpuidtest.S
+	# --build-id=none: see the numatest comment (multiboot span trap).
+	gcc -m32 -nostdlib -static -fno-pie \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext=0x101000 -Wl,--section-start=.multiboot=0x100000 \
+	    -o $@ $<
 
-EXTRA_BUILT += BOOTX64.EFI efi-fat.img efiremotetest.bin numadisttest nodeslice-big nodeslice-mmio
-RUNTARGETS += run-cxltest run-efiremotetest run-nodeslice run-nodeslicebig run-nodeslicemmio run-numadisttest run-numatest run-percputest run-slicecount run-unevennuma
+run-cpuidtest: cpuidtest
+	$(QEMU) -machine 'pc,nto64-per-cpu-cpuid=1:-avx2,nto64-per-cpu-core-type=0:0x40;1:0x20,nto64-per-cpu-tsc-scale=0:1;1:2,nto64-per-cpu-pause-ns=0:0;1:20' \
+	    -cpu max \
+	    -smp 2 -m 64 \
+	    -kernel cpuidtest -serial stdio -display none -no-reboot
+#: same-class run: both vCPUs report core type 0x40, so the core-class
+# bit alone cannot separate their translated code - only the effective
+# per-CPU feature set can.  CPU 1 loses AVX2, so its vpaddd must still
+# #UD (the hybrid run proves the same thing, but with the classes also
+# differing, which used to be enough on its own).
+cpuidtest-same: cpuidtest.S $(BUILD_DEPS)
+	# --build-id=none: see the numatest comment (multiboot span trap).
+	gcc -m32 -nostdlib -static -fno-pie -DNTO64_SAME_CLASS=1 \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext=0x101000 -Wl,--section-start=.multiboot=0x100000 \
+	    -o $@ $<
+
+run-cpuidtestsame: cpuidtest-same
+	$(QEMU) -machine 'pc,nto64-per-cpu-cpuid=1:-avx2,nto64-per-cpu-core-type=0:0x40;1:0x40,nto64-per-cpu-tsc-scale=0:1;1:2' \
+	    -cpu max \
+	    -smp 2 -m 64 \
+	    -kernel cpuidtest-same -serial stdio -display none -no-reboot
+
+
+
+
+EXTRA_BUILT += BOOTX64.EFI efi-fat.img efiremotetest.bin numadisttest cpuidtest-same nodeslice-big nodeslice-mmio
+RUNTARGETS += run-cpuidtest run-cpuidtestsame run-cxltest run-efiremotetest run-nodeslice run-nodeslicebig run-nodeslicemmio run-numadisttest run-numatest run-percputest run-slicecount run-unevennuma

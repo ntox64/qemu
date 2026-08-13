@@ -947,6 +947,8 @@ uint64_t x86_cpu_get_supported_feature_word(X86CPU *cpu, FeatureWord w);
 #define CPUID_7_0_EDX_MD_CLEAR          (1U << 10)
 /* SERIALIZE instruction */
 #define CPUID_7_0_EDX_SERIALIZE         (1U << 14)
+/* Hybrid part (Intel hybrid: P + E cores) */
+#define CPUID_7_0_EDX_HYBRID            (1U << 15)
 /* TSX Suspend Load Address Tracking instruction */
 #define CPUID_7_0_EDX_TSX_LDTRK         (1U << 16)
 /* Architectural LBRs */
@@ -2181,6 +2183,42 @@ struct ArchCPU {
     VMChangeStateEntry *vmsentry;
 
     uint64_t ucode_rev;
+    /*
+     * nto64: per-CPU hybrid core type for CPUID.1AH (0x40 P-core,
+     * 0x20 E-core); 0 = not a hybrid part.  Set per cpu_index by the
+     * testbed's nto64-per-cpu-core-type machine property.
+     */
+    uint32_t nto64_core_type;
+    /*
+     * nto64: per-CPU TSC scale (the testbed's "instruction-cost
+     * delay"): the same code reports this many x the TSC delta on this
+     * vCPU (1 = normal).  Set per cpu_index by the
+     * nto64-per-cpu-tsc-scale machine property.
+     */
+    uint32_t nto64_tsc_scale;
+    /*
+     * nto64: per-CPU instruction-cost delay in ns - the little core
+     * busy-waits this much per translated TB, so the same code
+     * genuinely runs slower (wall time too, unlike tsc-scale).
+     */
+    uint64_t nto64_pause_ns;
+    /*
+     * nto64: amortized pause accumulator (ns) - the helper adds the
+     * per-TB budget and busy-waits only when the batch quantum is
+     * reached, so the per-TB cost is just a couple of loads/adds.
+     */
+    int64_t nto64_pause_acc;
+    /*
+     * nto64: translation variant for the TB cache key.  The per-CPU
+     * CPUID override lets vCPUs of one machine run with different
+     * feature sets, and the translator emits its #UD and its
+     * little-core pause from the *translating* vCPU's state, so a TB
+     * may only be reused by vCPUs whose sets match exactly.  The
+     * variant is assigned by x86_cpu_nto64_apply_per_cpu() and folded
+     * into the TB flags by x86_get_tb_cpu_state(); 0 is the untuned
+     * configuration, where every vCPU shares the stock code.
+     */
+    uint32_t nto64_tb_variant;
 
     uint32_t hyperv_spinlock_attempts;
     char *hyperv_vendor;

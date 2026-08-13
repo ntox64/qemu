@@ -1629,6 +1629,77 @@ static void pc_machine_set_nto64_numa_distance(Object *obj, Visitor *v,
     visit_type_uint8(v, name, &pcms->nto64_numa_distance, errp);
 }
 
+static char *pc_machine_get_nto64_per_cpu_cpuid(Object *obj, Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    return g_strdup(pcms->nto64_per_cpu_cpuid);
+}
+
+static void pc_machine_set_nto64_per_cpu_cpuid(Object *obj,
+                                               const char *value,
+                                               Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    g_free(pcms->nto64_per_cpu_cpuid);
+    pcms->nto64_per_cpu_cpuid = g_strdup(value);
+}
+
+static char *pc_machine_get_nto64_per_cpu_core_type(Object *obj,
+                                                    Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    return g_strdup(pcms->nto64_per_cpu_core_type);
+}
+
+static void pc_machine_set_nto64_per_cpu_core_type(Object *obj,
+                                                   const char *value,
+                                                   Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    g_free(pcms->nto64_per_cpu_core_type);
+    pcms->nto64_per_cpu_core_type = g_strdup(value);
+}
+
+static char *pc_machine_get_nto64_per_cpu_tsc_scale(Object *obj,
+                                                    Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    return g_strdup(pcms->nto64_per_cpu_tsc_scale);
+}
+
+static void pc_machine_set_nto64_per_cpu_tsc_scale(Object *obj,
+                                                   const char *value,
+                                                   Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    g_free(pcms->nto64_per_cpu_tsc_scale);
+    pcms->nto64_per_cpu_tsc_scale = g_strdup(value);
+}
+
+static char *pc_machine_get_nto64_per_cpu_pause_ns(Object *obj,
+                                                   Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    return g_strdup(pcms->nto64_per_cpu_pause_ns);
+}
+
+static void pc_machine_set_nto64_per_cpu_pause_ns(Object *obj,
+                                                  const char *value,
+                                                  Error **errp)
+{
+    PCMachineState *pcms = PC_MACHINE(obj);
+
+    g_free(pcms->nto64_per_cpu_pause_ns);
+    pcms->nto64_per_cpu_pause_ns = g_strdup(value);
+}
+
 static bool pc_machine_get_i8042(Object *obj, Error **errp)
 {
     PCMachineState *pcms = PC_MACHINE(obj);
@@ -2140,6 +2211,37 @@ static void pc_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "nto64-numa-distance",
         "ACPI SLIT cross-node distance for the per-CPU slices "
         "(10-255, default 20)");
+
+    object_class_property_add_str(oc, "nto64-per-cpu-cpuid",
+        pc_machine_get_nto64_per_cpu_cpuid,
+        pc_machine_set_nto64_per_cpu_cpuid);
+    object_class_property_set_description(oc, "nto64-per-cpu-cpuid",
+        "Per-vCPU CPUID feature overrides (testbed for AMP/hybrid): "
+        "\"cpu_index:feature|feature|...;...\", e.g. "
+        "\"0:avx2|avx;1:sse4.2\"");
+
+    object_class_property_add_str(oc, "nto64-per-cpu-core-type",
+        pc_machine_get_nto64_per_cpu_core_type,
+        pc_machine_set_nto64_per_cpu_core_type);
+    object_class_property_set_description(oc, "nto64-per-cpu-core-type",
+        "Per-vCPU hybrid core types for CPUID.1AH (0x40 P-core, 0x20 "
+        "E-core), \"cpu_index:type;...\" - enables the hybrid flag");
+
+    object_class_property_add_str(oc, "nto64-per-cpu-tsc-scale",
+        pc_machine_get_nto64_per_cpu_tsc_scale,
+        pc_machine_set_nto64_per_cpu_tsc_scale);
+    object_class_property_set_description(oc, "nto64-per-cpu-tsc-scale",
+        "Per-vCPU TSC scale (little-core cycle accounting): the same "
+        "code reports this many x the TSC delta on that vCPU "
+        "(1 = normal), \"cpu_index:factor;...\"");
+
+    object_class_property_add_str(oc, "nto64-per-cpu-pause-ns",
+        pc_machine_get_nto64_per_cpu_pause_ns,
+        pc_machine_set_nto64_per_cpu_pause_ns);
+    object_class_property_set_description(oc, "nto64-per-cpu-pause-ns",
+        "Per-vCPU per-TB busy-wait in ns (little-core instruction-cost "
+        "delay; MTTCG only, little core 0x20), "
+        "\"cpu_index:ns;...\"");
 
     object_class_property_add_bool(oc, PC_MACHINE_I8042,
         pc_machine_get_i8042, pc_machine_set_i8042);

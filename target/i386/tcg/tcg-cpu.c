@@ -51,11 +51,24 @@ static void x86_cpu_exec_exit(CPUState *cs)
 static TCGTBCPUState x86_get_tb_cpu_state(CPUState *cs)
 {
     CPUX86State *env = cpu_env(cs);
+    X86CPU *cpu = X86_CPU(cs);
     uint32_t flags, cs_base;
     vaddr pc;
 
     flags = env->hflags |
         (env->eflags & (IOPL_MASK | TF_MASK | RF_MASK | VM_MASK | AC_MASK));
+    /*
+     * nto64: fold the per-CPU translation variant into the TB key
+     * (three spare bits above the HF_ flags).  The AMP/hybrid stand-in
+     * is not limited to a core-class difference: the per-CPU CPUID
+     * override can give two vCPUs of the same class different feature
+     * sets, and the translator emits its #UD (a feature the
+     * translating vCPU lacks) and its little-core pause from that
+     * vCPU's state.  Two vCPUs must therefore share a variant - and
+     * hence a TB - only when every translation input matches;
+     * x86_cpu_nto64_apply_per_cpu() assigns the index.
+     */
+    flags |= (uint32_t)cpu->nto64_tb_variant << 29;
     if (env->hflags & HF_CS64_MASK) {
         cs_base = 0;
         pc = env->eip;

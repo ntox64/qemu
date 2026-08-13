@@ -37,6 +37,9 @@
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
+#ifndef CONFIG_USER_ONLY
+#include "system/tcg.h"
+#endif
 #undef  HELPER_H
 
 /* Fixes for Windows namespace pollution.  */
@@ -3802,6 +3805,22 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
 
 static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
 {
+#ifndef CONFIG_USER_ONLY
+    /*
+     * nto64: per-CPU instruction-cost delay (AMP "little core"
+     * stand-in).  Guards: MTTCG only (a busy-wait on a round-robin
+     * vCPU thread would stall every vCPU) and only in the two-core-
+     * class config - the 0x20 little core busy-waits nto64_pause_ns
+     * per TB, so the same code genuinely runs slower (wall time too).
+     * The core-class bit in the TB flags keeps this code per-CPU.
+     */
+    X86CPU *x86cpu = X86_CPU(cpu);
+
+    if (qemu_tcg_mttcg_enabled() && x86cpu->nto64_core_type == 0x20 &&
+        x86cpu->nto64_pause_ns > 0) {
+        gen_helper_nto64_core_pause(tcg_env);
+    }
+#endif
 }
 
 static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)

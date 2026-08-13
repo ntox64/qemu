@@ -23,6 +23,8 @@
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
 #include "helper-tcg.h"
+#include "system/tcg.h"
+#include "qemu/timer.h"
 
 /*
  * NOTE: the translator must set DisasContext.cc_op to CC_OP_EFLAGS
@@ -99,6 +101,47 @@ G_NORETURN void helper_pause(CPUX86State *env)
     /* Just let another CPU run.  */
     cs->exception_index = EXCP_INTERRUPT;
     cpu_loop_exit(cs);
+}
+
+/* amortized pause batch: busy-wait this many ns at a time */
+#define NTO64_PAUSE_QUANTUM_NS 1000
+
+/*
+ * nto64: per-CPU instruction-cost delay.  Emitted once per translated
+ * TB on the little core (0x20) when nto64_per_cpu_pause_ns is set, but
+ * the cost is AMORTIZED: each call adds the per-TB budget to the CPU's
+ * accumulator, and only when the batch quantum is reached does the
+ * helper busy-wait (so the average cost is budget ns per TB while a
+ * single TB pays only a couple of loads/adds - no per-TB clock read or
+ * fixed delay, which made small slowdown ratios unconfigurable).
+ * Guards: MTTCG only (a busy-wait on a round-robin vCPU thread would
+ * stall every vCPU; under MTTCG each vCPU has its own host thread, so
+ * only this core slows).  Unlike helper_pause (a yield), this burns
+ * host time, so wall-time metrics also see the little core run slower.
+ */
+void HELPER(nto64_core_pause)(CPUX86State *env)
+{
+    X86CPU *cpu = env_archcpu(env);
+    int64_t budget = cpu->nto64_pause_ns;
+
+#ifndef CONFIG_USER_ONLY
+    if (!qemu_tcg_mttcg_enabled()) {
+        return;
+    }
+#endif
+    if (budget <= 0) {
+        return;
+    }
+    cpu->nto64_pause_acc += budget;
+    if (cpu->nto64_pause_acc >= NTO64_PAUSE_QUANTUM_NS) {
+        int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        int64_t wait = cpu->nto64_pause_acc;
+
+        cpu->nto64_pause_acc = 0;
+        while (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0 < wait) {
+            /* busy-wait the accumulated budget */
+        }
+    }
 }
 
 uint64_t helper_rdpkru(CPUX86State *env, uint32_t ecx)

@@ -34,7 +34,16 @@
 /* TSC handling */
 uint64_t cpu_get_tsc(CPUX86State *env)
 {
-    return cpus_get_elapsed_ticks();
+    uint32_t scale = env_archcpu(env)->nto64_tsc_scale;
+
+    if (scale == 0) {
+        scale = 1;
+    }
+    /*
+     * nto64: per-CPU TSC scale (little-core cycle accounting) - the
+     * same code reports `scale` x the TSC delta on this vCPU.
+     */
+    return cpus_get_elapsed_ticks() * scale;
 }
 
 /* IRQ handling */

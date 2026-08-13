@@ -195,3 +195,34 @@ builds.
    parser is exercised rather than a private channel.  There is no
    runtime node hot-add, and no CXL memory interleave or striping: the
    tables are exposed and checked, not managed.
+
+
+Per-CPU CPUID and hybrid enumeration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``env->features`` is already per-CPU state, so the machine can vary it per
+``cpu_index``: per-CPU CPUID and feature overrides, the Intel hybrid
+enumeration leaves (``0x1A`` core type, the hybrid flag), TSC scaling, and
+a per-translation-block pause hook that slows the "little" side of the
+part.
+
+Run ``make run-cpuidtest`` (BSP + APIC 1, ``-smp 2``): the test asserts
+each vCPU's core type (0x40/0x20), AVX2 (BSP only), the hybrid flag and
+the max leaf, the TSC scale ratio measured over one shared wall-clock
+window, and the #UD the translator must raise for the AP's ``vpaddd``.
+The window is a two-way handshake: the BSP opens it, then waits (with a
+bound) for the ``tsc_apdone`` flag the AP sets after publishing its own
+span, so a vCPU thread that is late to ``tsc_stop`` cannot be read as a
+zero span and blamed on the scaling.
+``make run-cpuidtestsame`` repeats it with *both* cores in the 0x40
+class: there the core-class bit in the TB key cannot separate them, so
+only the effective per-CPU feature set keeps the AP from running the
+BSP's AVX2 code (its #UD is the regression).
+
+.. note::
+   Stock x86 TCG is homogeneous, so a test that assumes every CPU matches
+   proves nothing, and a kernel that caches CPUID once merely looks
+   correct.  Only x86 is covered: this tree's ARM ``virt`` machine
+   enumerates one CPU type for every slot, so mixed-core ARM is a later
+   QEMU problem, and the per-CPU override is the portable stand-in rather
+   than an ARM test.

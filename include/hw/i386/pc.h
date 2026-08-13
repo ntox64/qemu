@@ -56,6 +56,10 @@ typedef struct PCMachineState {
     bool nto64_per_cpu_ram;
     uint64_t nto64_per_cpu_ram_base;
     uint8_t nto64_numa_distance;   /* ACPI SLIT cross-node distance */
+    char *nto64_per_cpu_cpuid;      /* per-vCPU CPUID feature overrides */
+    char *nto64_per_cpu_core_type;  /* per-vCPU hybrid core types */
+    char *nto64_per_cpu_tsc_scale;  /* per-vCPU TSC scale factors */
+    char *nto64_per_cpu_pause_ns;   /* per-vCPU per-TB pause budget */
     bool default_bus_bypass_iommu;
     bool fd_bootchk;
     uint64_t max_fw_size;

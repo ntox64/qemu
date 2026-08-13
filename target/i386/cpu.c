@@ -8249,6 +8249,17 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         }
         break;
     }
+    case 0x1A:
+        /*
+         * Hybrid: core type (bits 31:24, 0x40 P-core / 0x20 E-core)
+         * and native model id (bits 23:0) - the per-CPU AMP/hybrid
+         * stand-in (nto64-per-cpu-core-type).
+         */
+        *eax = (cpu->nto64_core_type & 0xff) << 24;
+        *ebx = 0;
+        *ecx = 0;
+        *edx = 0;
+        break;
     case 0x1C:
         if (cpu->enable_pmu && (env->features[FEAT_7_0_EDX] & CPUID_7_0_EDX_ARCH_LBR)) {
             x86_cpu_get_supported_cpuid(0x1C, 0, eax, ebx, ecx, edx);
@@ -9189,6 +9200,308 @@ static bool x86_cpu_filter_features(X86CPU *cpu, bool verbose)
     return have_filtered_features;
 }
 
+#ifndef CONFIG_USER_ONLY
+/*
+ * nto64: per-CPU CPUID override - the testbed's portable stand-in for
+ * ARM big.LITTLE and Intel P+E hybrids (main project:
+ * "vary env->features per cpu_index").  Reads the pc/q35 machine
+ * properties nto64-per-cpu-cpuid and nto64-per-cpu-core-type and applies
+ * the entry matching cpu->cpu_index:
+ * nto64-per-cpu-cpuid="cpu:feat|feat|...;..."  (feat = +name, -name,
+ * name, or name=on|off; '|' separates features because the machine
+ * option parser splits on ','; e.g. "0:avx2|avx;1:sse4.2")
+ * nto64-per-cpu-core-type="cpu:type;..."        (0x40 P-core, 0x20
+ * E-core per CPUID.1AH)
+ * nto64-per-cpu-tsc-scale="cpu:factor;..."      (little-core cycle
+ * accounting: the same loop reports factor x the TSC delta)
+ * nto64-per-cpu-pause-ns="cpu:ns;..."            (little-core
+ * instruction-cost delay: busy-wait ns per TB on the 0x20 core)
+ * When any core type is configured the whole package is hybrid: every
+ * vCPU reports the hybrid flag (CPUID.7.0.EDX[15]) and leaf 0x1A is
+ * enabled, while each vCPU's own type varies.
+ */
+static bool x86_cpu_nto64_parse_bool(const char *v, bool *on, Error **errp)
+{
+    if (!strcmp(v, "on") || !strcmp(v, "true") || !strcmp(v, "1")) {
+        *on = true;
+        return true;
+    }
+    if (!strcmp(v, "off") || !strcmp(v, "false") || !strcmp(v, "0")) {
+        *on = false;
+        return true;
+    }
+    error_setg(errp, "nto64-per-cpu-cpuid: invalid boolean '%s'", v);
+    return false;
+}
+
+/*
+ * nto64: registry of the translation-visible per-CPU configurations.
+ *
+ * The TB cache key is (pc, cs_base, flags), and the translator decides
+ * instruction legality and the little-core pause from the vCPU doing
+ * the translation: the DisasContext feature words, the 0x20 core class
+ * and whether a per-TB pause is armed.  vCPUs that differ in any of
+ * those must not share translated code - two 0x40 cores with different
+ * CPUID features would otherwise run each other's AVX/AVX2 legality -
+ * so each vCPU gets a variant index for the TB flags (three spare bits
+ * above the HF_ flags).  Identical configurations share an index; more
+ * than NTO64_TB_VARIANTS distinct configurations cannot be told apart
+ * in the key and are rejected rather than silently conflated.
+ */
+#define NTO64_TB_VARIANTS 8
+
+typedef struct Nto64TbVariant {
+    /* the 8 words DisasContext captures for the decoder, then the core
+     * class and the pause-armed flag */
+    uint32_t w[10];
+} Nto64TbVariant;
+
+static Nto64TbVariant nto64_tb_variants[NTO64_TB_VARIANTS];
+static unsigned nto64_tb_variants_n;
+
+static int x86_cpu_nto64_tb_variant(const Nto64TbVariant *key, Error **errp)
+{
+    unsigned i;
+
+    for (i = 0; i < nto64_tb_variants_n; i++) {
+        if (!memcmp(&nto64_tb_variants[i], key, sizeof(*key))) {
+            return i;
+        }
+    }
+    if (nto64_tb_variants_n == NTO64_TB_VARIANTS) {
+        error_setg(errp, "nto64-per-cpu-*: more than %d distinct per-vCPU "
+                   "configurations; the TB cache key cannot tell their "
+                   "translated code apart", NTO64_TB_VARIANTS);
+        return -1;
+    }
+    nto64_tb_variants[nto64_tb_variants_n] = *key;
+    return nto64_tb_variants_n++;
+}
+
+static void x86_cpu_nto64_apply_per_cpu(X86CPU *cpu, Error **errp)
+{
+    CPUX86State *env = &cpu->env;
+    Object *machine = OBJECT(qdev_get_machine());
+    g_autofree char *cpuid_str = NULL;
+    g_autofree char *core_str = NULL;
+    g_autofree char *scale_str = NULL;
+    g_autofree char *pause_str = NULL;
+    char **entries = NULL;
+    int i, n;
+
+    cpuid_str = object_property_get_str(machine, "nto64-per-cpu-cpuid",
+                                        NULL);
+    core_str = object_property_get_str(machine, "nto64-per-cpu-core-type",
+                                       NULL);
+    scale_str = object_property_get_str(machine, "nto64-per-cpu-tsc-scale",
+                                        NULL);
+    pause_str = object_property_get_str(machine, "nto64-per-cpu-pause-ns",
+                                        NULL);
+    if (cpuid_str && !*cpuid_str) {
+        g_free(cpuid_str);
+        cpuid_str = NULL;
+    }
+    if (core_str && !*core_str) {
+        g_free(core_str);
+        core_str = NULL;
+    }
+    if (scale_str && !*scale_str) {
+        g_free(scale_str);
+        scale_str = NULL;
+    }
+    if (pause_str && !*pause_str) {
+        g_free(pause_str);
+        pause_str = NULL;
+    }
+    if (!cpuid_str && !core_str && !scale_str && !pause_str) {
+        return;
+    }
+
+    /*
+     * core types first: they define the two AMP classes, and the
+     * per-CPU CPUID override is scoped to that two-type config
+     */
+    if (core_str) {
+        entries = g_strsplit(core_str, ";", -1);
+        for (i = 0; entries[i]; i++) {
+            char *eq = strchr(entries[i], ':');
+            unsigned long idx = 0;
+            uint64_t type;
+            const char *end = NULL;
+
+            if (!eq || qemu_strtoul(entries[i], &end, 0, &idx) ||
+                end != eq ||
+                idx != CPU(cpu)->cpu_index) {
+                continue;
+            }
+            if (qemu_strtou64(eq + 1, &end, 0, &type) || *end ||
+                type > 0xff) {
+                error_setg(errp, "nto64-per-cpu-core-type: bad core "
+                           "type '%s' (expect 0x40 P-core / 0x20 E-core)",
+                           eq + 1);
+                g_strfreev(entries);
+                return;
+            }
+            cpu->nto64_core_type = (uint32_t)type;
+        }
+        /* Hybrid package: flag + leaf on every vCPU, type varies. */
+        env->features[FEAT_7_0_EDX] |= CPUID_7_0_EDX_HYBRID;
+        if (env->cpuid_level < 0x1A) {
+            env->cpuid_level = 0x1A;
+        }
+        g_strfreev(entries);
+        entries = NULL;
+    }
+
+    if (cpuid_str) {
+        if (!core_str) {
+            error_setg(errp, "nto64-per-cpu-cpuid requires "
+                       "nto64-per-cpu-core-type (the per-CPU CPUID "
+                       "override is scoped to the two-core-type config)");
+            return;
+        }
+        /*
+         * two-type guard: only CPUs that are part of the two configured
+         * core classes get the per-CPU feature override
+         */
+        if (cpu->nto64_core_type != 0) {
+            entries = g_strsplit(cpuid_str, ";", -1);
+            for (i = 0; entries[i]; i++) {
+                char *eq = strchr(entries[i], ':');
+                unsigned long idx = 0;
+                char **feats;
+                const char *end = NULL;
+
+                if (!eq || qemu_strtoul(entries[i], &end, 0, &idx) ||
+                    end != eq || idx != CPU(cpu)->cpu_index) {
+                    continue;
+                }
+                feats = g_strsplit(eq + 1, "|", -1);
+                for (n = 0; feats[n]; n++) {
+                    const char *tok = feats[n];
+                    const char *name = tok;
+                    bool on = true;
+                    g_autofree char *alloc = NULL;
+
+                    if (!*tok) {
+                        continue;
+                    }
+                    if (*tok == '+') {
+                        name++;
+                    } else if (*tok == '-') {
+                        name++;
+                        on = false;
+                    } else {
+                        const char *v = strchr(tok, '=');
+                        if (v) {
+                            alloc = g_strndup(tok, v - tok);
+                            name = alloc;
+                            if (!x86_cpu_nto64_parse_bool(v + 1, &on,
+                                                          errp)) {
+                                g_strfreev(feats);
+                                g_strfreev(entries);
+                                return;
+                            }
+                        }
+                    }
+                    if (!object_property_set_bool(OBJECT(cpu), name, on,
+                                                  errp)) {
+                        g_strfreev(feats);
+                        g_strfreev(entries);
+                        return;
+                    }
+                }
+                g_strfreev(feats);
+            }
+            g_strfreev(entries);
+        }
+    }
+
+    if (scale_str) {
+        entries = g_strsplit(scale_str, ";", -1);
+        for (i = 0; entries[i]; i++) {
+            char *eq = strchr(entries[i], ':');
+            unsigned long idx = 0;
+            uint64_t factor;
+            const char *end = NULL;
+
+            if (!eq || qemu_strtoul(entries[i], &end, 0, &idx) ||
+                end != eq) {
+                continue;
+            }
+            if (qemu_strtou64(eq + 1, &end, 0, &factor) || *end ||
+                factor == 0 || factor > 10000) {
+                error_setg(errp, "nto64-per-cpu-tsc-scale: bad factor "
+                           "'%s' (expect a positive integer, 1 = normal)",
+                           eq + 1);
+                g_strfreev(entries);
+                return;
+            }
+            if (idx == CPU(cpu)->cpu_index) {
+                cpu->nto64_tsc_scale = (uint32_t)factor;
+            }
+        }
+        g_strfreev(entries);
+    }
+
+    if (pause_str) {
+        entries = g_strsplit(pause_str, ";", -1);
+        for (i = 0; entries[i]; i++) {
+            char *eq = strchr(entries[i], ':');
+            unsigned long idx = 0;
+            uint64_t ns;
+            const char *end = NULL;
+
+            if (!eq || qemu_strtoul(entries[i], &end, 0, &idx) ||
+                end != eq) {
+                continue;
+            }
+            if (qemu_strtou64(eq + 1, &end, 0, &ns) || *end) {
+                error_setg(errp, "nto64-per-cpu-pause-ns: bad value "
+                           "'%s' (expect ns per TB, 0 = off)", eq + 1);
+                g_strfreev(entries);
+                return;
+            }
+            if (idx == CPU(cpu)->cpu_index) {
+                cpu->nto64_pause_ns = ns;
+            }
+        }
+        g_strfreev(entries);
+    }
+
+    /*
+     * Done overriding: fold the effective translation inputs into a
+     * variant index so vCPUs with different ones never share TBs (see
+     * x86_cpu_nto64_tb_variant).  The feature words are the ones
+     * DisasContext captures for the decoder, so a per-CPU AVX2 (or any
+     * other feature) override is part of the key.
+     */
+    {
+        Nto64TbVariant key = { 0 };
+        unsigned k = 0;
+        int variant;
+
+        key.w[k++] = env->features[FEAT_1_EDX];
+        key.w[k++] = env->features[FEAT_1_ECX];
+        key.w[k++] = env->features[FEAT_8000_0001_EDX];
+        key.w[k++] = env->features[FEAT_8000_0001_ECX];
+        key.w[k++] = env->features[FEAT_7_0_EBX];
+        key.w[k++] = env->features[FEAT_7_0_ECX];
+        key.w[k++] = env->features[FEAT_7_1_EAX];
+        key.w[k++] = env->features[FEAT_XSAVE];
+        key.w[k++] = (cpu->nto64_core_type == 0x20);
+        key.w[k++] = (cpu->nto64_core_type == 0x20 &&
+                      cpu->nto64_pause_ns > 0);
+
+        variant = x86_cpu_nto64_tb_variant(&key, errp);
+        if (variant < 0) {
+            return;
+        }
+        cpu->nto64_tb_variant = variant;
+    }
+}
+#endif /* !CONFIG_USER_ONLY */
+
 static void x86_cpu_hyperv_realize(X86CPU *cpu)
 {
     size_t len;
@@ -9541,6 +9854,16 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
         goto out;
     }
 #endif /* !CONFIG_USER_ONLY */
+#ifndef CONFIG_USER_ONLY
+    /*
+     * nto64: per-CPU CPUID override (testbed for AMP/hybrid) - applied
+     * after feature filtering so the override always wins.
+     */
+    x86_cpu_nto64_apply_per_cpu(cpu, &local_err);
+    if (local_err != NULL) {
+        goto out;
+    }
+#endif
     cpu_reset(cs);
 
     xcc->parent_realize(dev, &local_err);
