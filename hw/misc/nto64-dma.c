@@ -113,6 +113,10 @@ typedef struct Nto64DmaState {
     uint32_t qselect;         /* per-queue register window selector */
     uint32_t ring_queue;      /* queue index for the async per-queue start */
     bool queue_start;         /* 0x54-driven per-queue ring in flight */
+    /*
+     * DMA through the PCI/IOMMU AS instead of the vCPU (node) memory view
+     */
+    bool iommu;
     QEMUBH *bh;
 } Nto64DmaState;
 
@@ -478,9 +482,9 @@ static void nto64_dma_realize(PCIDevice *pci_dev, Error **errp)
 {
     Nto64DmaState *s = NTO64_DMA(pci_dev);
     CPUState *cpu = qemu_get_cpu(s->node);
-    int i;
+    int i, j;
 
-    if (!cpu || !cpu->memory) {
+    if (!s->iommu && (!cpu || !cpu->memory)) {
         error_setg(errp, "nto64-dma: node %u has no memory view",
                    s->node);
         return;
@@ -490,21 +494,54 @@ static void nto64_dma_realize(PCIDevice *pci_dev, Error **errp)
                    NTO64_DMA_QUEUE_MAX);
         return;
     }
-    s->dma_root = cpu->memory;
+    /*
+     * DMA address space selection: by default the engine is bound to a
+     * vCPU's memory view (node) - that AS bypasses any
+     * guest-visible IOMMU, because device DMA through an AS rooted at
+     * the vCPU view never enters the PCI bus's IOMMU translation.  With
+     * `iommu=on` the engine's AS is rooted at the PCI/IOMMU address
+     * space (pci_device_iommu_address_space), so DMA IOVAs are
+     * translated by the guest-programmed IOMMU page tables (VT-d /
+     * AMD-Vi) instead of resolving through the node view -
+     * per-CPU-AS x IOMMU interplay question.
+     */
+    if (s->iommu) {
+        s->dma_root = pci_device_iommu_address_space(pci_dev)->root;
+        info_report("nto64-dma: DMA AS via PCI IOMMU");
+    } else {
+        s->dma_root = cpu->memory;
+    }
     address_space_init(&s->dma_as, s->dma_root, "nto64-dma-as");
     s->queues = g_new0(Nto64DmaQueue, s->queues_n);
     for (i = 0; i < s->queues_n; i++) {
         Nto64DmaQueue *qq = &s->queues[i];
-        CPUState *qc = qemu_get_cpu(i);
 
-        if (!qc || !qc->memory) {
-            error_setg(errp, "nto64-dma: queue %u needs vCPU %u memory view",
-                       i, i);
-            g_free(s->queues);
-            s->queues = NULL;
-            return;
+        if (s->iommu) {
+            qq->root = s->dma_root;
+        } else {
+            CPUState *qc = qemu_get_cpu(i);
+
+            if (!qc || !qc->memory) {
+                error_setg(errp,
+                           "nto64-dma: queue %u needs vCPU %u memory view",
+                           i, i);
+                /*
+                 * The queues set up so far are linked into the global
+                 * address_spaces list - walked by every memory
+                 * transaction commit, and the list's tail pointer is the
+                 * next address_space_init()'s write target - so they have
+                 * to leave that list before the array holding them goes
+                 * away.  A failed realize never runs the device's .exit.
+                 */
+                for (j = 0; j < i; j++) {
+                    address_space_destroy(&s->queues[j].as);
+                }
+                g_free(s->queues);
+                s->queues = NULL;
+                return;
+            }
+            qq->root = qc->memory;
         }
-        qq->root = qc->memory;
         qq->ring_stride = 16;
         address_space_init(&qq->as, qq->root, "nto64-dma-q-as");
     }
@@ -550,6 +587,7 @@ static const Property nto64_dma_props[] = {
                        NTO64_DMA_MAX_XFER),
     DEFINE_PROP_UINT32("queues", Nto64DmaState, queues_n,
                        NTO64_DMA_QUEUES_DEFAULT),
+    DEFINE_PROP_BOOL("iommu", Nto64DmaState, iommu, false),
 };
 
 static void nto64_dma_class_init(ObjectClass *klass, const void *data)

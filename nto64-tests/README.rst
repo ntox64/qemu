@@ -340,3 +340,22 @@ what the device claims to have sent.
    different fault and is not produced here.  This case shares the
    ``msixtest`` harness with the DMA completion phases below, so it lands
    just after them.
+
+
+IOMMU-rooted DMA
+~~~~~~~~~~~~~~~~
+
+``nto64-dma,iommu=on`` roots the DMA address space at
+``pci_device_iommu_address_space()`` instead of the vCPU view, so guest
+IOVAs are translated by the guest's own tables and node binding becomes a
+property of an IOMMU domain.
+
+Run ``make run-iommutest``, which builds VT-d root, context and an L2
+with 2 MiB pages from scratch and then shows the translated path through
+the IOMMU against the bypassing path of the node-bound device.
+
+.. note::
+   Only the DMA-remapping half of VT-d is exercised: no interrupt
+   remapping, no queued invalidation, no PASID.  The contrast between the
+   two roots is the point - it is the only way a test can show which path
+   a transfer actually took.
