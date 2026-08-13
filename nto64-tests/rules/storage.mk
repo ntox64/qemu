@@ -274,6 +274,21 @@ run-satad2hlie2: ahcitest sata-d2hlie.conf
 	    -kernel ahcitest -append 'NTO64EXP=11111000000003' \
 	    -serial stdio -display none -no-reboot
 
+nvmetest: nvmetest.S
+	# --build-id=none: see the numatest comment (multiboot span trap).
+	gcc -m32 -nostdlib -static -fno-pie \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext=0x101000 -Wl,--section-start=.multiboot=0x100000 \
+	    -o $@ $<
+
+run-nvmetest: nvmetest
+	truncate -s 64M /tmp/nvme-test.img
+	$(QEMU) -machine q35,nto64-per-cpu-ram=on -smp 2 -m 128 \
+	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6 \
+	    -drive file=/tmp/nvme-test.img,if=none,id=drv0,format=raw \
+	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
+	    -kernel nvmetest -serial stdio -display none -no-reboot
+
 
 EXTRA_BUILT +=
-RUNTARGETS += run-ahciintr run-ahciintrdrop run-satabadtrack run-satad2hlie run-satad2hlie2 run-sataerr run-satancq run-satapersist run-satasdblie run-sataslow run-satastuck run-satatest run-scsibringup run-scsierr run-scsifault run-scsiintr run-scsiintrinj run-scsimedia run-scsitest run-scsiwp run-vblkbadtrack run-vblkerr run-vblkpersist run-vblkringfull run-vblktest
+RUNTARGETS += run-ahciintr run-ahciintrdrop run-nvmetest run-satabadtrack run-satad2hlie run-satad2hlie2 run-sataerr run-satancq run-satapersist run-satasdblie run-sataslow run-satastuck run-satatest run-scsibringup run-scsierr run-scsifault run-scsiintr run-scsiintrinj run-scsimedia run-scsitest run-scsiwp run-vblkbadtrack run-vblkerr run-vblkpersist run-vblkringfull run-vblktest

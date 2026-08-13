@@ -583,3 +583,21 @@ Run ``make run-satatest``, ``run-satabadtrack``, ``run-sataerr``,
    state - and either can contradict the other, which is invisible to a
    driver that trusts one.  The two ``*-lie`` cases exist for that.  No
    cable or PHY behaviour beyond link state, and no port multiplier.
+
+
+NVMe multi-queue stress
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Run ``make run-nvmetest``: it builds the admin and I/O queues from
+scratch against the stock ``nvme`` device and drives them concurrently
+with per-queue MSI-X vectors.
+
+.. note::
+   No testbed change is needed for this one, and that is worth stating:
+   queue creation order and completions against the right queue are the
+   parts a driver cannot fake.  Two limits of the environment matter:
+   same-vector interrupts fired rapidly coalesce in the local APIC IRR, so
+   the case asserts minimum deliveries and verifies by polling and data;
+   and firmware state is real - SeaBIOS leaves the controller enabled with
+   its own queues, so a driver that does not reset first writes enable bits
+   that are already no-ops.
