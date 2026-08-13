@@ -24,6 +24,12 @@
  *         internal storage.  The memdev must be dedicated to this
  *         device: a backend also mapped elsewhere (e.g. machine RAM)
  *         would count and delay those accesses too.
+ *         PCIe Resizable BAR (REBAR): BAR0 is resizable between
+ *         64 MiB and 512 MiB via the REBAR extended capability at
+ *         ECAM offset 0x100 (PCI_EXT_CAP_ID_REBAR, one variable BAR,
+ *         sizes 64M/128M/256M/512M).  Writing the REBAR Control
+ *         BAR Size field resizes the BAR in place; the guest then
+ *         re-probes/reassigns the BAR like any REBAR device.
  *   BAR1: 4 KiB control MMIO:
  *           0x00 magic "NTO6"
  *           0x04 doorbell counter (write rings)
@@ -46,6 +52,7 @@
 #include "qemu/error-report.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
+#include "hw/pci/pcie.h"
 #include "hw/pci/msi.h"
 #include "hw/qdev-properties.h"
 #include "system/hostmem.h"
@@ -62,6 +69,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(Nto64BarmemState, NTO64_BARMEM)
 #define NTO64_BARMEM_MAGIC       0x4e544f36u /* "NTO6" */
 #define NTO64_BARMEM_BAR0_DEFAULT (256 * MiB)
 #define NTO64_BARMEM_CTRL_SIZE   0x1000
+
+/*
+ * REBAR: one variable BAR (BAR0), supported sizes 64M/128M/256M/512M
+ * (size index n = 2^(20+n) bytes).  The capability is the first PCIe
+ * extended capability (ECAM offset 0x100), reachable on q35.
+ */
+#define NTO64_BARMEM_PCIE_CAP_OFF 0xe0
+#define NTO64_BARMEM_REBAR_CAP_OFF 0x100
+#define NTO64_BARMEM_REBAR_SIZES \
+    ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9))
 
 #define NTO64_BARMEM_CTRL_MMIO   0x1     /* BAR0 trap-based MMIO path */
 #define NTO64_BARMEM_CTRL_IRQ    0x2     /* doorbell raises an IRQ */
@@ -85,6 +102,8 @@ typedef struct Nto64BarmemState {
     uint32_t bar_reads, bar_writes;
     uint32_t bar_delay_ns;
     bool irq_level_active;
+    uint32_t rebar_sizes;     /* supported REBAR size-index mask */
+    uint16_t rebar_cap;       /* extended cap offset (0 if disabled) */
 } Nto64BarmemState;
 
 /*
@@ -254,11 +273,67 @@ static const MemoryRegionOps nto64_barmem_ctrl_ops = {
     },
 };
 
+/*
+ * Resize BAR0 to the REBAR size index @idx (in place).  The PCI core's
+ * notion of the BAR size (io_regions[0].size) is updated so the size
+ * probe and pci_bar_address use the new size; the container/alias/MMIO
+ * regions shrink or grow over the backing storage (allocated at the
+ * max supported size).
+ */
+static void nto64_barmem_rebar_set_size(Nto64BarmemState *s, unsigned idx)
+{
+    uint64_t newsize = 1ULL << (20 + idx);
+    MemoryRegion *backing = s->hostmem
+        ? host_memory_backend_get_memory(s->hostmem)
+        : &s->bar0_storage;
+
+    if (!(s->rebar_sizes & (1u << idx)) ||
+        newsize > memory_region_size(backing) ||
+        newsize == s->bar0_size) {
+        return;
+    }
+
+    memory_region_set_size(&s->bar0_container, newsize);
+    memory_region_set_size(&s->bar0_alias, newsize);
+    memory_region_set_size(&s->bar0_mmio, newsize);
+    s->bar0_size = newsize;
+    s->pdev.io_regions[0].size = newsize;
+    /*
+     * The BAR config wmask (set at registration from the old size)
+     * must follow the resize, or the guest's size probe keeps seeing
+     * the original mask.
+     */
+    pci_set_long(s->pdev.wmask + pci_bar(&s->pdev, 0),
+                 ~(newsize - 1) & 0xffffffff);
+    info_report("nto64-barmem: BAR0 resized to %" PRIu64 " MiB",
+                newsize / MiB);
+}
+
+static void nto64_barmem_config_write(PCIDevice *pci_dev, uint32_t addr,
+                                      uint32_t val, int len)
+{
+    Nto64BarmemState *s = NTO64_BARMEM(pci_dev);
+
+    pci_default_write_config(pci_dev, addr, val, len);
+
+    if (s->rebar_cap &&
+        ranges_overlap(addr, len, s->rebar_cap + PCI_REBAR_CTRL, 4)) {
+        uint32_t ctrl = pci_get_long(pci_dev->config +
+                                     s->rebar_cap + PCI_REBAR_CTRL);
+        unsigned idx = (ctrl & PCI_REBAR_CTRL_BAR_SIZE) >>
+                       PCI_REBAR_CTRL_BAR_SHIFT;
+
+        nto64_barmem_rebar_set_size(s, idx);
+    }
+}
+
 static void nto64_barmem_realize(PCIDevice *pci_dev, Error **errp)
 {
     Nto64BarmemState *s = NTO64_BARMEM(pci_dev);
     MemoryRegion *mem;
     uint64_t size = s->bar0_size;
+    uint64_t storage_size = size;
+    int i;
 
     if (!is_power_of_2(size)) {
         error_setg(errp, "nto64-barmem: bar-size must be a power of two");
@@ -283,11 +358,26 @@ static void nto64_barmem_realize(PCIDevice *pci_dev, Error **errp)
          * internal anon storage below.
          */
         memory_region_set_instrumented(mem, nto64_barmem_hook, s);
+        /* Clamp the REBAR size set to what the backend can hold. */
+        for (i = 0; i < 32; i++) {
+            if ((s->rebar_sizes & (1u << i)) &&
+                (1ULL << (20 + i)) > memory_region_size(mem)) {
+                s->rebar_sizes &= ~(1u << i);
+            }
+        }
         info_report("nto64-barmem: BAR0 %" PRIu64 " MiB aliased to backend '%s'",
                     size / MiB, object_get_canonical_path(OBJECT(s->hostmem)));
     } else {
+        /*
+         * Back the BAR with enough storage for the largest REBAR size
+         * so resizing can grow in place.
+         */
+        if (s->rebar_sizes) {
+            int max_idx = 31 - clz32(s->rebar_sizes);
+            storage_size = MAX(storage_size, 1ULL << (20 + max_idx));
+        }
         memory_region_init_ram(&s->bar0_storage, OBJECT(s),
-                               "nto64-barmem-ram", size, errp);
+                               "nto64-barmem-ram", storage_size, errp);
         if (*errp) {
             return;
         }
@@ -315,6 +405,49 @@ static void nto64_barmem_realize(PCIDevice *pci_dev, Error **errp)
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY,
                      &s->bar0_container);
 
+    /*
+     * PCIe endpoint + Resizable BAR capability.  The REBAR cap is only
+     * added when the initial size is one of the supported sizes.
+     */
+    if (s->rebar_sizes && size >= (1ULL << 20) &&
+        (s->rebar_sizes & (1u << (__builtin_ctzll(size) - 20)))) {
+        uint16_t pos;
+        uint32_t cap, ctrl;
+        unsigned idx = __builtin_ctzll(size) - 20;
+
+        /*
+         * Hybrid device: conventional interface + PCIe capabilities.
+         * cap_present is set in instance_init so pci_config_alloc
+         * gives the device 4 KiB config space (the extended REBAR cap
+         * is reachable via ECAM on q35).
+         */
+        pcie_endpoint_cap_init(pci_dev, NTO64_BARMEM_PCIE_CAP_OFF);
+        pcie_add_capability(pci_dev, PCI_EXT_CAP_ID_REBAR, 1,
+                            NTO64_BARMEM_REBAR_CAP_OFF, 16);
+        pos = NTO64_BARMEM_REBAR_CAP_OFF;
+        s->rebar_cap = pos;
+
+        /*
+         * PCIe 7.0 Table 7-165: supported sizes live in bits 4..23 of
+         * the capability register; bits 3:0 are RsvdP (must read 0).
+         * Table 7-166: the control register carries NBARs in bits 7:5,
+         * the current BAR Size (one encoded index) in bits 13:8, and
+         * BAR Index (RO, 0 for BAR0) in bits 2:0.
+         */
+        cap = (s->rebar_sizes << 4);
+        ctrl = (1u << PCI_REBAR_CTRL_NBAR_SHIFT) |
+               ((uint32_t)idx << PCI_REBAR_CTRL_BAR_SHIFT);
+        pci_set_long(pci_dev->config + pos + PCI_REBAR_CAP, cap);
+        pci_set_long(pci_dev->config + pos + PCI_REBAR_CTRL, ctrl);
+        /* Only BAR Size (13:8) is writable; BAR Index (2:0) is RO. */
+        pci_set_long(pci_dev->wmask + pos + PCI_REBAR_CTRL,
+                     PCI_REBAR_CTRL_BAR_SIZE);
+        info_report("nto64-barmem: REBAR cap at 0x%x (sizes 64M-512M)",
+                    pos);
+    } else {
+        s->rebar_cap = 0;
+    }
+
     pci_config_set_interrupt_pin(pci_dev->config, 1);   /* INTx#A */
     memory_region_init_io(&s->ctrl, OBJECT(s), &nto64_barmem_ctrl_ops, s,
                           "nto64-barmem-ctrl", NTO64_BARMEM_CTRL_SIZE);
@@ -336,9 +469,24 @@ static void nto64_barmem_exit(PCIDevice *pci_dev)
     }
 }
 
+static void nto64_barmem_instance_init(Object *obj)
+{
+    PCIDevice *pci_dev = PCI_DEVICE(obj);
+
+    /*
+     * Hybrid PCI: keep the conventional interface (works on pc) but
+     * request the 4 KiB config space a PCIe device gets, so the REBAR
+     * extended capability can live in ECAM space on q35.  Must happen
+     * before pci_config_alloc.
+     */
+    pci_dev->cap_present |= QEMU_PCI_CAP_EXPRESS;
+}
+
 static const Property nto64_barmem_props[] = {
     DEFINE_PROP_UINT64("bar-size", Nto64BarmemState, bar0_size,
                        NTO64_BARMEM_BAR0_DEFAULT),
+    DEFINE_PROP_UINT32("rebar-sizes", Nto64BarmemState, rebar_sizes,
+                       NTO64_BARMEM_REBAR_SIZES),
     DEFINE_PROP_LINK("memdev", Nto64BarmemState, hostmem,
                      TYPE_MEMORY_BACKEND, HostMemoryBackend *),
 };
@@ -351,6 +499,7 @@ static void nto64_barmem_class_init(ObjectClass *klass, const void *data)
     (void)data;
     k->realize = nto64_barmem_realize;
     k->exit = nto64_barmem_exit;
+    k->config_write = nto64_barmem_config_write;
     k->vendor_id = NTO64_BARMEM_VENDOR;
     k->device_id = NTO64_BARMEM_DEVICE;
     k->revision = NTO64_BARMEM_REVISION;
@@ -365,6 +514,7 @@ static const TypeInfo nto64_barmem_info = {
     .name = TYPE_NTO64_BARMEM,
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(Nto64BarmemState),
+    .instance_init = nto64_barmem_instance_init,
     .class_init = nto64_barmem_class_init,
     .interfaces = (InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },

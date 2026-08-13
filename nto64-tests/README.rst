@@ -448,3 +448,23 @@ Run ``make run-barmemtest``.
    followed by region 2, since ``pci_bar()`` places region *N* at
    ``0x10 + N*4`` and a region-1 control BAR clobbers BAR0's high write
    mask.
+
+
+Resizable BAR
+~~~~~~~~~~~~~
+
+``nto64-barmem`` exposes the Resizable BAR extended capability as the
+first entry in the extended list at ECAM offset ``0x100``, in a 4 KiB
+configuration space.  ``rebar-sizes`` lists the supported sizes (64M,
+128M, 256M, 512M by default) and BAR0 resizes in place; the capability is
+omitted entirely when the initial ``bar-size`` is not one of them.
+
+Run ``make run-rebartest``, which walks the size list, resizes down and up
+while writing and reading across the new boundary, and confirms the
+mapping was torn down and re-established rather than left stale.
+
+.. note::
+   The BAR configuration write mask and the guest's size probe follow
+   every resize, otherwise the probe keeps reporting the old size and the
+   test proves nothing.  Only one BAR is resizable, and there is no
+   negotiation with a hypervisor.
