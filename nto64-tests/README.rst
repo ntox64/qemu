@@ -107,8 +107,10 @@ Node slices and the interconnect
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Machine RAM is partitioned into one slice per node, with
-``nto64-numa-cores-per-node`` vCPUs per node (default one).  The
-``nto64-remote`` device owns the window: a foreign slice is reached
+``nto64-numa-cores-per-node`` vCPUs per node (default one); an explicit
+``-numa`` topology replaces that shape, including node capacities that
+differ from each other.  The ``nto64-remote`` device owns the window: a
+foreign slice is reached
 through the trap region and is write-behind, so a read immediately after a
 remote write returns the previous value, while the node's own page stays
 direct RAM.  The ``ccnuma`` control bit makes shared RAM coherent by
@@ -134,9 +136,26 @@ is wired to ISA line 9.
   0x28/0x2c    slice read / write counters
   0x3c         slice delay, ns
 
-Run ``make run-slicecount`` for the counters and the delay gate, and ``make run-efiremotetest`` to touch a foreign
-CPU's memory from a long-mode EFI application with the secondary CPUs
-brought up through ``INIT``/``SIPI``.
+Run ``make run-slicecount`` for the counters and the delay gate,
+``make run-nodeslice`` for the ownership rule that survives more than
+one vCPU per node (``nto64-numa-cores-per-node=2``: APIC 1's own slice
+must stay uncounted direct RAM while the other node's slice is counted
+per access - with one vCPU per node the node id and the ``cpu_index``
+happen to agree and a wrong comparison still looks right), plus
+``make run-nodeslicebig`` for the same rule when RAM spills above 4G
+(``-m 3G`` leaves 2 GiB below 4G while the node slices are 1.5 GiB, so
+slicing the low span instead of the machine RAM would move the boundary
+out from under node 0's own memory), ``make run-nodeslicemmio`` for a
+node 1 vCPU probing the VGA window inside node 0's slice (it first
+proves node 0's RAM is counted for it, then reads the window: a device
+page inside a foreign range has to stay plain MMIO), and
+``make run-unevennuma`` for the range boundaries under an explicit
+32 MiB / 96 MiB ``-numa`` topology (the split has to accumulate
+``node_mem``; an even ``ram_size / num_nodes`` split would call node
+1's 32-64 MiB local for cpu 0), and
+``make run-efiremotetest`` to touch a foreign CPU's memory from a
+long-mode EFI application with the secondary CPUs brought up through
+``INIT``/``SIPI``.
 
 .. note::
    The delay is a host busy-wait, so it models relative timing rather
@@ -144,3 +163,35 @@ brought up through ``INIT``/``SIPI``.
    snooping, ownership or partial-line state to corrupt.  The EFI case
    exists because it is the only way to exercise the window while
    firmware, and not our own boot code, owns the page tables.
+
+.. note::
+   The instrumented ranges are the node ranges the ``SRAT`` describes,
+   clipped to the RAM the machine actually has below 4G (the ranges
+   accumulate each node's ``node_mem`` in address order: the implicit
+   shape fills equal slices into it and an explicit ``-numa`` topology
+   may size the nodes unevenly, so on a machine whose RAM spills above 4G
+   the last range can be short and a node whose range starts past the low
+   window has no range down here at all).  RAM above 4G stays direct and
+   uninstrumented - it is RAM for every vCPU, so it is not part of the
+   cross-node model.
+
+
+Topology through firmware tables
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With ``nto64-per-cpu-ram`` enabled and no ``-numa`` option given, the
+derived nodes fill the machine's stock NUMA state, so QEMU's own ACPI
+builder emits ``SRAT`` (each RAM range with its proximity domain) and
+``SLIT`` (cross-node distance from ``nto64-numa-distance``, default 20).
+An explicit ``-numa`` topology always wins and is left untouched.
+
+Run ``make run-numatest`` to walk ``RSDP`` to ``SRAT``/``SLIT`` and check
+the ranges and the distance matrix, and ``make run-cxltest`` to validate
+the ``CEDT`` ``CHBS`` and ``CFMWS`` entries against the window the machine
+builds.
+
+.. note::
+   Nothing here defines a new table format - the point is that a topology
+   parser is exercised rather than a private channel.  There is no
+   runtime node hot-add, and no CXL memory interleave or striping: the
+   tables are exposed and checked, not managed.

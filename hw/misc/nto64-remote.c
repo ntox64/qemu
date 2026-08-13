@@ -11,8 +11,9 @@
  * to each cpu may occur out of order" model for the nto64 memory-
  * hierarchy work .
  *
- * Whole-RAM node slices: with slice-size/slices set, one
- * coherent trap region per node overlays the machine RAM range in
+ * Whole-RAM node slices: with slice-size/slices (a uniform grid) or
+ * slice-sizes (one size per node, for an explicit -numa topology)
+ * set, one coherent trap region per node overlays the machine RAM range in
  * each CPU's address-space root - the owning CPU's slice is direct
  * RAM, every foreign slice is a trap that reads/writes the SAME host
  * RAM (so the guest sees one flat, coherent memory: hardware-NUMA /
@@ -97,8 +98,11 @@ typedef struct Nto64RemoteState {
 
     /* whole-RAM node slices */
     uint64_t slice_base;       /* guest base of the first slice */
-    uint64_t slice_size;
+    uint64_t slice_size;       /* uniform grid when slice_sizes is unset */
+    uint64_t slice_span;       /* RAM covered by the slices (0 = all) */
     uint32_t nslices;
+    uint32_t nslice_sizes;     /* explicit per-node sizes (`slice-sizes`) */
+    uint64_t *slice_sizes;
     uint32_t slice_reads, slice_writes;
     uint32_t slice_delay_ns;   /* manual per-access remote latency */
 } Nto64RemoteState;
@@ -386,13 +390,48 @@ static void nto64_remote_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->ctrl);
     sysbus_init_irq(sbd, &s->irq);
 
-    if (s->slice_size && s->nslices) {
+    if (s->nslice_sizes || (s->slice_size && s->nslices)) {
+        /*
+         * A node owns its node_mem bytes of the machine RAM in address
+         * order, but only the part of that range that is actually RAM
+         * can be instrumented: on x86 the machine's low RAM ends at
+         * below_4g_mem_size and the rest of the address space up to
+         * above_4g_mem_start is MMIO hole.  slice-span is that RAM
+         * window (0 = the caller sliced RAM that has no hole), so the
+         * last range is clipped and nodes whose range starts past the
+         * window have no range at all - exactly the memory the SRAT
+         * attributes to them below 4G.  slice-sizes carries the sizes
+         * of an explicit -numa topology (they need not be equal; the
+         * machine accumulates node_mem); slice-size/slices is the
+         * uniform grid a stand-alone user gets.
+         */
         uint32_t i;
         uint64_t base = s->slice_base;
+        uint32_t nranges = s->nslice_sizes ? s->nslice_sizes : s->nslices;
+        uint64_t span = s->slice_span;
+        uint64_t start = base;
+        uint32_t nregistered = 0;
+        uint64_t nbytes = 0;
 
-        for (i = 0; i < s->nslices; i++) {
+        if (!span) {
+            if (s->nslice_sizes) {
+                for (i = 0; i < s->nslice_sizes; i++) {
+                    span += s->slice_sizes[i];
+                }
+            } else {
+                span = s->slice_size * s->nslices;
+            }
+        }
+        for (i = 0; i < nranges; i++) {
+            uint64_t size = s->nslice_sizes ? s->slice_sizes[i]
+                                            : s->slice_size;
             Nto64Slice *sl = g_new0(Nto64Slice, 1);
 
+            if (start >= base + span) {
+                g_free(sl);
+                break;
+            }
+            size = MIN(size, base + span - start);
             sl->s = s;
             sl->node = i;
             /*
@@ -409,12 +448,15 @@ static void nto64_remote_realize(DeviceState *dev, Error **errp)
              * instrumentation is resolved by physical range at TLB fill
              * time.
              */
-            memory_region_register_instrument_range(
-                base + (uint64_t)i * s->slice_size, s->slice_size, i,
-                nto64_slice_hook, sl);
+            memory_region_register_instrument_range(start, size, i,
+                                                    nto64_slice_hook, sl);
+            nregistered++;
+            nbytes += size;
+            start += size;
         }
-        info_report("nto64-remote: %u instrumented RAM ranges of %" PRIu64
-                    " bytes at 0x%" PRIx64, s->nslices, s->slice_size, base);
+        info_report("nto64-remote: %u instrumented node ranges, %" PRIu64
+                    " bytes (RAM window 0x%" PRIx64 "-0x%" PRIx64 ")",
+                    nregistered, nbytes, base, base + span);
     }
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, nto64_remote_commit, s);
@@ -425,6 +467,7 @@ static void nto64_remote_unrealize(DeviceState *dev)
     Nto64RemoteState *s = NTO64_REMOTE(dev);
 
     timer_free(s->timer);
+    g_free(s->slice_sizes);
     g_free(s->visible);
     g_free(s->pending);
     g_free(s->pending_deadline);
@@ -437,6 +480,9 @@ static const Property nto64_remote_props[] = {
     DEFINE_PROP_UINT32("jitter-ns", Nto64RemoteState, jitter_ns, 0),
     DEFINE_PROP_BOOL("ccnuma", Nto64RemoteState, ccnuma, false),
     DEFINE_PROP_UINT64("slice-size", Nto64RemoteState, slice_size, 0),
+    DEFINE_PROP_ARRAY("slice-sizes", Nto64RemoteState, nslice_sizes,
+                      slice_sizes, qdev_prop_uint64, uint64_t),
+    DEFINE_PROP_UINT64("slice-span", Nto64RemoteState, slice_span, 0),
     DEFINE_PROP_UINT32("slices", Nto64RemoteState, nslices, 0),
     DEFINE_PROP_UINT64("slice-base", Nto64RemoteState, slice_base, 0),
     DEFINE_PROP_UINT32("slice-delay-ns", Nto64RemoteState, slice_delay_ns, 0),

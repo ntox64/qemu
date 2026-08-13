@@ -1365,7 +1365,7 @@ build_srat(GArray *table_data, BIOSLinker *linker, MachineState *machine)
     const CPUArchIdList *apic_ids = mc->possible_cpu_arch_ids(machine);
     int nb_numa_nodes = machine->numa_state->num_nodes;
     NodeInfo *numa_info = machine->numa_state->nodes;
-    AcpiTable table = { .sig = "SRAT", .rev = 1, .oem_id = x86ms->oem_id,
+    AcpiTable table = { .sig = "SRAT", .rev = 3, .oem_id = x86ms->oem_id,
                         .oem_table_id = x86ms->oem_table_id };
 
     acpi_table_begin(&table, table_data);

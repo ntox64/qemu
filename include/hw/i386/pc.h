@@ -49,8 +49,13 @@ typedef struct PCMachineState {
     bool sata_enabled;
     bool hpet_enabled;
     bool i8042_enabled;
+    /*
+     * vCPUs per ACPI NUMA node / RAM slice (1 = one node per vCPU)
+     */
+    uint32_t nto64_numa_cores_per_node;
     bool nto64_per_cpu_ram;
     uint64_t nto64_per_cpu_ram_base;
+    uint8_t nto64_numa_distance;   /* ACPI SLIT cross-node distance */
     bool default_bus_bypass_iommu;
     bool fd_bootchk;
     uint64_t max_fw_size;
@@ -200,6 +205,12 @@ void pc_nic_init(PCMachineClass *pcmc, ISABus *isa_bus, PCIBus *pci_bus);
 
 void pc_nto64_remote_create(PCMachineState *pcms);
 void pc_nto64_remote_connect_irq(PCMachineState *pcms);
+/*
+ * nto64-per-cpu-ram: derive the whole-RAM NUMA shape (max_cpus vCPUs
+ * grouped nto64-numa-cores-per-node per node; 1 = one node per vCPU).
+ */
+void pc_nto64_slice_shape(MachineState *ms, PCMachineState *pcms,
+                          uint32_t *num_nodes, uint64_t *slice);
 
 void pc_i8259_create(ISABus *isa_bus, qemu_irq *i8259_irqs);
 
