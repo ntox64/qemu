@@ -30,6 +30,10 @@
  *         sizes 64M/128M/256M/512M).  Writing the REBAR Control
  *         BAR Size field resizes the BAR in place; the guest then
  *         re-probes/reassigns the BAR like any REBAR device.
+ *         With `bar64=on` BAR0 is a 64-bit memory BAR (the Smart
+ *         Access Memory shape): multi-GiB sizes via the `rebar-sizes`
+ *         mask (e.g. 1G|2G|4G|8G = bits 10-13), so the whole window
+ *         can be mapped above 4 GiB and resized in place.
  *   BAR1: 4 KiB control MMIO:
  *           0x00 magic "NTO6"
  *           0x04 doorbell counter (write rings)
@@ -104,6 +108,7 @@ typedef struct Nto64BarmemState {
     bool irq_level_active;
     uint32_t rebar_sizes;     /* supported REBAR size-index mask */
     uint16_t rebar_cap;       /* extended cap offset (0 if disabled) */
+    bool bar64;               /* BAR0 is a 64-bit memory BAR */
 } Nto64BarmemState;
 
 /*
@@ -283,6 +288,7 @@ static const MemoryRegionOps nto64_barmem_ctrl_ops = {
 static void nto64_barmem_rebar_set_size(Nto64BarmemState *s, unsigned idx)
 {
     uint64_t newsize = 1ULL << (20 + idx);
+    uint64_t wmask = ~(newsize - 1);
     MemoryRegion *backing = s->hostmem
         ? host_memory_backend_get_memory(s->hostmem)
         : &s->bar0_storage;
@@ -303,8 +309,12 @@ static void nto64_barmem_rebar_set_size(Nto64BarmemState *s, unsigned idx)
      * must follow the resize, or the guest's size probe keeps seeing
      * the original mask.
      */
-    pci_set_long(s->pdev.wmask + pci_bar(&s->pdev, 0),
-                 ~(newsize - 1) & 0xffffffff);
+    if (s->bar64) {
+        pci_set_quad(s->pdev.wmask + pci_bar(&s->pdev, 0), wmask);
+    } else {
+        pci_set_long(s->pdev.wmask + pci_bar(&s->pdev, 0),
+                     wmask & 0xffffffff);
+    }
     info_report("nto64-barmem: BAR0 resized to %" PRIu64 " MiB",
                 newsize / MiB);
 }
@@ -402,9 +412,11 @@ static void nto64_barmem_realize(PCIDevice *pci_dev, Error **errp)
     memory_region_add_subregion(&s->bar0_container, 0, &s->bar0_alias);
     memory_region_add_subregion(&s->bar0_container, 0, &s->bar0_mmio);
     memory_region_set_enabled(&s->bar0_mmio, false);
-    pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY,
+    pci_register_bar(pci_dev, 0,
+                     PCI_BASE_ADDRESS_SPACE_MEMORY |
+                     (s->bar64 ? (PCI_BASE_ADDRESS_MEM_TYPE_64 |
+                                  PCI_BASE_ADDRESS_MEM_PREFETCH) : 0),
                      &s->bar0_container);
-
     /*
      * PCIe endpoint + Resizable BAR capability.  The REBAR cap is only
      * added when the initial size is one of the supported sizes.
@@ -442,8 +454,13 @@ static void nto64_barmem_realize(PCIDevice *pci_dev, Error **errp)
         /* Only BAR Size (13:8) is writable; BAR Index (2:0) is RO. */
         pci_set_long(pci_dev->wmask + pos + PCI_REBAR_CTRL,
                      PCI_REBAR_CTRL_BAR_SIZE);
-        info_report("nto64-barmem: REBAR cap at 0x%x (sizes 64M-512M)",
-                    pos);
+        info_report("nto64-barmem: REBAR cap at 0x%x (sizes %" PRIu64
+                    "-%" PRIu64 " MiB)",
+                    pos,
+                    (uint64_t)(1ULL << (20 + __builtin_ctz(s->rebar_sizes)))
+                        / MiB,
+                    (uint64_t)(1ULL << (20 + (31 - clz32(s->rebar_sizes))))
+                        / MiB);
     } else {
         s->rebar_cap = 0;
     }
@@ -451,7 +468,14 @@ static void nto64_barmem_realize(PCIDevice *pci_dev, Error **errp)
     pci_config_set_interrupt_pin(pci_dev->config, 1);   /* INTx#A */
     memory_region_init_io(&s->ctrl, OBJECT(s), &nto64_barmem_ctrl_ops, s,
                           "nto64-barmem-ctrl", NTO64_BARMEM_CTRL_SIZE);
-    pci_register_bar(pci_dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->ctrl);
+    /*
+     * Region index 2 when BAR0 is 64-bit: QEMU's pci_bar places
+     * region N at config 0x10 + N*4, so a 64-bit BAR0 (two dwords)
+     * must be followed by region 2 (config 0x18), not 1 - otherwise
+     * the ctrl BAR registration clobbers BAR0's high dword.
+     */
+    pci_register_bar(pci_dev, s->bar64 ? 2 : 1,
+                     PCI_BASE_ADDRESS_SPACE_MEMORY, &s->ctrl);
 
     if (msi_init(pci_dev, 0x60, 1, true, false, errp)) {
         return;
@@ -489,6 +513,7 @@ static const Property nto64_barmem_props[] = {
                        NTO64_BARMEM_REBAR_SIZES),
     DEFINE_PROP_LINK("memdev", Nto64BarmemState, hostmem,
                      TYPE_MEMORY_BACKEND, HostMemoryBackend *),
+    DEFINE_PROP_BOOL("bar64", Nto64BarmemState, bar64, false),
 };
 
 static void nto64_barmem_class_init(ObjectClass *klass, const void *data)

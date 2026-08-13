@@ -468,3 +468,24 @@ mapping was torn down and re-established rather than left stale.
    every resize, otherwise the probe keeps reporting the old size and the
    test proves nothing.  Only one BAR is resizable, and there is no
    negotiation with a hypervisor.
+
+
+Multi-GiB BAR and SR-IOV enumeration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The resizable list also covers the several-GiB 64-bit BAR mapped above
+4G, the shape device memory that a CPU pointer-chases actually ships in.
+Run ``make run-samtest`` to map it, write and read back across the top.
+Run ``make run-sriovtest`` against a stock SR-IOV layout to walk the
+capability, read the VF device ID, stride and offset, enable VF memory
+space and check that the VFs appear where the capability says they
+should.
+
+.. note::
+   Both fail at range or width rather than at logic: a 32-bit-only
+   mapping breaks at the top of a multi-GiB BAR, and anything at ``0x100``
+   and above is unreachable through ``CF8``/``CFC``.  The VFs come from a
+   stock device, so VF flavour heterogeneity, per-VF PRI and ATS
+   invalidation are not covered.  Guest-side walks keep their pointers in
+   callee-saved registers, because the print helpers clobber
+   caller-saved ones between a configuration read and its comparison.
