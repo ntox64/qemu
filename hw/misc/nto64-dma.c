@@ -18,7 +18,8 @@
  *     0x08 source address low, 0x0c high
  *     0x10 dest address low, 0x14 high
  *     0x18 size (bytes, capped at max-xfer)
- *     0x1c status: bit0 busy, bit1 done, bit2 error (write 0 clears)
+ *     0x1c status: bit0 busy, bit1 done, bit2 error, bit3 fault
+ *          (write 0 clears)
  *     0x20 transfers completed
  *     0x24 bytes moved
  *     0x28 ring base low, 0x2c high (ring mode)
@@ -38,6 +39,19 @@
  *     0x60/0x64 per-queue bytes moved
  *     0x68 peer-P2P transfers completed (P2P mode, read-only)
  *     0x6c peer-P2P bytes moved low, 0x70 high (read-only)
+ *     0x74 fault control: bit0 fault-window enable, bit1 inject a
+ *          fault on the next transfer (self-clearing), bit2 resolve /
+ *          retry (write 1 re-runs the faulted transfer after the
+ *          guest fixed the mapping), bit3 fault IRQ enable (the fault
+ *          fires MSI-X vector `queues`)
+ *     0x78 fault status: bit0 pending (a transfer stopped on a
+ *          device fault, awaiting resolve/retry)
+ *     0x7c/0x80 fault address low/high (first faulting byte)
+ *     0x84 fault count (number of faults latched)
+ *     0x88/0x8c fault window base low/high, 0x90 window size bytes
+ *          (0 disables the window; the window models a not-present
+ *          range in the device's page tables - a PRI/ATS-style
+ *          device fault)
  *
  * The 0x28-0x38 ring registers alias queue 0, so the legacy single-ring
  * mode (control bit2 + start) is the "queue 0" case.
@@ -66,6 +80,17 @@
  *     descriptor with both bits set relocates data within device
  *     memory with no CPU involvement).
  *
+ * Device faults (PRI-like): with the fault window enabled,
+ * any DMA chunk whose device-AS-side address range overlaps the
+ * window stops the transfer immediately (chunks before the faulting
+ * one stay written - partial progress, like a real page fault mid-
+ * DMA), latches the first faulting byte in 0x7c/0x80, increments
+ * 0x84, sets status bit3 + fault-status bit0, and raises the fault
+ * MSI-X vector (`queues`).  The guest "resolves" the fault by fixing
+ * the mapping (moving/disabling the window or clearing the inject)
+ * and writing fault-control bit2: the device then retries the
+ * interrupted transfer from the start.  `queues` MSI-X vectors are
+ * used for queue completions, plus one extra vector for faults.
  * The ring mode walks the descriptors one small transfer at a time,
  * firing the completion MSI-X per message (NIC/RDMA-style); the bulk
  * mode does one chunked transfer of up to max-xfer bytes
@@ -117,6 +142,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(Nto64DmaState, NTO64_DMA)
 #define NTO64_DMA_ST_BUSY 0x1
 #define NTO64_DMA_ST_DONE 0x2
 #define NTO64_DMA_ST_ERR  0x4
+#define NTO64_DMA_ST_FAULT 0x8   /* stopped on a device fault */
+
+#define NTO64_DMA_FAULT_WIN     0x1  /* window checks enabled */
+#define NTO64_DMA_FAULT_INJECT  0x2  /* inject on the next transfer */
+#define NTO64_DMA_FAULT_RESOLVE 0x4  /* resolve + retry the faulted xfer */
+#define NTO64_DMA_FAULT_IRQEN   0x8  /* fault IRQ (MSI-X vector `queues`) */
+
+#define NTO64_DMA_FST_PENDING 0x1
 
 typedef struct Nto64DmaState {
     PCIDevice pdev;
@@ -132,17 +165,17 @@ typedef struct Nto64DmaState {
     uint32_t status;
     uint32_t xfers;
     uint64_t bytes;
+    uint32_t queues_n;        /* `queues` property (MSI-X vectors too) */
+    struct Nto64DmaQueue *queues;
+    uint32_t qselect;         /* per-queue register window selector */
+    uint32_t ring_queue;      /* queue index for the async per-queue start */
+    bool queue_start;         /* 0x54-driven per-queue ring in flight */
     uint64_t bulk_src, bulk_dst;  /* snapshot of the in-flight bulk op */
     uint32_t bulk_len;            /* total bytes of the bulk op */
     uint64_t bulk_off;            /* bytes moved so far */
     bool bulk_p2p;                /* bulk target is the peer BAR */
     bool bulk_rev;                /* P2P direction: peer -> device */
     uint8_t *bounce;              /* shared 1 MiB chunk buffer */
-    uint32_t queues_n;        /* `queues` property (MSI-X vectors too) */
-    struct Nto64DmaQueue *queues;
-    uint32_t qselect;         /* per-queue register window selector */
-    uint32_t ring_queue;      /* queue index for the async per-queue start */
-    bool queue_start;         /* 0x54-driven per-queue ring in flight */
     /*
      * DMA through the PCI/IOMMU AS instead of the vCPU (node) memory view
      */
@@ -153,6 +186,14 @@ typedef struct Nto64DmaState {
     AddressSpace peer_as;     /* AS rooted at the peer BAR (P2P side) */
     uint32_t p2p_xfers;       /* P2P transfers completed */
     uint64_t p2p_bytes;       /* P2P bytes moved */
+    uint32_t fault_ctrl;      /* fault control (0x74) */
+    uint32_t fault_status;    /* fault status (0x78) */
+    uint64_t fault_addr;      /* first faulting byte (0x7c/0x80) */
+    uint32_t fault_count;     /* faults latched (0x84) */
+    uint64_t fault_win_base;  /* fault window base (0x88/0x8c) */
+    uint32_t fault_win_size;  /* fault window size (0x90), 0 = off */
+    bool retry_ring;          /* the faulted op was a ring batch */
+    unsigned retry_queue;     /* ...and which queue */
     QEMUBH *bh;
 } Nto64DmaState;
 
@@ -171,33 +212,79 @@ typedef struct Nto64DmaQueue {
     uint64_t bytes;
 } Nto64DmaQueue;
 
-/* Chunked copy of len bytes from src (src_as) to dst (dst_as). */
-static bool nto64_dma_copy2(AddressSpace *src_as, AddressSpace *dst_as,
-                            hwaddr src, hwaddr dst, uint32_t len,
-                            uint8_t *buf)
+typedef enum Nto64DmaResult {
+    NTO64_DMA_OK,
+    NTO64_DMA_FAULT,
+    NTO64_DMA_ERR,
+} Nto64DmaResult;
+
+/* Does [addr, addr+len) overlap the fault window? */
+static bool nto64_dma_in_window(Nto64DmaState *s, hwaddr addr, uint32_t len)
 {
+    uint64_t wb = s->fault_win_base;
+    uint64_t we = wb + s->fault_win_size;
+
+    if (!(s->fault_ctrl & NTO64_DMA_FAULT_WIN) || !s->fault_win_size) {
+        return false;
+    }
+    return addr + len > wb && addr < we;
+}
+
+/*
+ * First byte of [addr, addr+len) inside the window (the faulting
+ * byte the OS's fault path would resolve).
+ */
+static hwaddr nto64_dma_fault_byte(Nto64DmaState *s, hwaddr addr)
+{
+    uint64_t wb = s->fault_win_base;
+
+    return addr < wb ? wb : addr;
+}
+
+/*
+ * Chunked copy with per-chunk PRI-like fault checks on the device-AS
+ * side (the peer BAR side is device memory - no page faults there).
+ * A chunk overlapping the window returns FAULT before moving it, so
+ * everything before the faulting chunk stays written (partial
+ * progress, like a page fault mid-DMA).  Returns OK/FAULT/ERR.
+ */
+static Nto64DmaResult nto64_dma_copy_checked(Nto64DmaState *s,
+                                             AddressSpace *dev_as,
+                                             hwaddr src, hwaddr dst,
+                                             uint32_t len,
+                                             bool src_peer, bool dst_peer,
+                                             uint8_t *buf)
+{
+    AddressSpace *src_as = src_peer ? &s->peer_as : dev_as;
+    AddressSpace *dst_as = dst_peer ? &s->peer_as : dev_as;
     uint64_t off;
 
+    if ((s->fault_ctrl & NTO64_DMA_FAULT_INJECT) && len) {
+        /* injected fault: the next transfer faults at its first byte */
+        s->fault_addr = src_peer ? dst : src;
+        return NTO64_DMA_FAULT;
+    }
     for (off = 0; off < len; off += NTO64_DMA_CHUNK) {
         uint32_t chunk = MIN(NTO64_DMA_CHUNK, len - off);
         MemTxResult r1, r2;
 
+        if (!src_peer && nto64_dma_in_window(s, src + off, chunk)) {
+            s->fault_addr = nto64_dma_fault_byte(s, src + off);
+            return NTO64_DMA_FAULT;
+        }
+        if (!dst_peer && nto64_dma_in_window(s, dst + off, chunk)) {
+            s->fault_addr = nto64_dma_fault_byte(s, dst + off);
+            return NTO64_DMA_FAULT;
+        }
         r1 = address_space_rw(src_as, src + off,
                               MEMTXATTRS_UNSPECIFIED, buf, chunk, false);
         r2 = address_space_rw(dst_as, dst + off,
                               MEMTXATTRS_UNSPECIFIED, buf, chunk, true);
         if (r1 != MEMTX_OK || r2 != MEMTX_OK) {
-            return false;
+            return NTO64_DMA_ERR;
         }
     }
-    return true;
-}
-
-/* Chunked copy of len bytes from src to dst through one @as. */
-static bool nto64_dma_copy_as(AddressSpace *as, hwaddr src, hwaddr dst,
-                              uint32_t len, uint8_t *buf)
-{
-    return nto64_dma_copy2(as, as, src, dst, len, buf);
+    return NTO64_DMA_OK;
 }
 
 /*
@@ -206,13 +293,11 @@ static bool nto64_dma_copy_as(AddressSpace *as, hwaddr src, hwaddr dst,
  * realize (`peer` + `peer-bar`); the other endpoint goes through the
  * caller's address space (the bulk engine's AS or a queue's AS).
  */
-static bool nto64_dma_xfer(Nto64DmaState *s, AddressSpace *dev_as,
-                           hwaddr src, hwaddr dst, uint32_t len,
-                           bool src_peer, bool dst_peer, uint8_t *buf)
+static Nto64DmaResult nto64_dma_xfer(Nto64DmaState *s, AddressSpace *dev_as,
+                                     hwaddr src, hwaddr dst, uint32_t len,
+                                     bool src_peer, bool dst_peer,
+                                     uint8_t *buf)
 {
-    AddressSpace *src_as = src_peer ? &s->peer_as : dev_as;
-    AddressSpace *dst_as = dst_peer ? &s->peer_as : dev_as;
-
     /*
      * A ring descriptor may name either endpoint as a peer BAR offset
      * even when the device has no `peer` (s->peer_mr stays NULL and
@@ -221,25 +306,48 @@ static bool nto64_dma_xfer(Nto64DmaState *s, AddressSpace *dev_as,
      * path does instead of walking an uninitialised address space.
      */
     if ((src_peer || dst_peer) && !s->peer_mr) {
-        return false;
+        return NTO64_DMA_ERR;
     }
-    return nto64_dma_copy2(src_as, dst_as, src, dst, len, buf);
+    return nto64_dma_copy_checked(s, dev_as, src, dst, len,
+                                  src_peer, dst_peer, buf);
 }
 
 /*
- * Bulk-mode P2P copy: direction from control bit4.  Returns false if
- * no peer is configured or the copy fails.
+ * Bulk-mode P2P copy: direction from control bit4.  Returns OK only
+ * if a peer is configured; FAULT/ERR propagate.
  */
-static bool nto64_dma_copy_peer(Nto64DmaState *s, hwaddr src, hwaddr dst,
-                                uint32_t len)
+static Nto64DmaResult nto64_dma_copy_peer(Nto64DmaState *s, hwaddr src,
+                                          hwaddr dst, uint32_t len)
 {
     bool rev = s->control & NTO64_DMA_CTRL_P2PREV;
 
     if (!s->peer_mr) {
-        return false;
+        return NTO64_DMA_ERR;
     }
-    return nto64_dma_xfer(s, &s->dma_as, src, dst, len,
-                          rev, !rev, s->bounce);
+    return nto64_dma_xfer(s, &s->dma_as, src, dst, len, rev, !rev,
+                          s->bounce);
+}
+
+/*
+ * Latch a device fault: stop the transfer, record the address, raise
+ * the fault MSI-X vector (`queues`), and remember the interrupted
+ * operation for the resolve/retry path.
+ */
+static void nto64_dma_latch_fault(Nto64DmaState *s, hwaddr addr,
+                                  bool ring, unsigned q)
+{
+    s->status = NTO64_DMA_ST_FAULT;
+    s->fault_status = NTO64_DMA_FST_PENDING;
+    s->fault_addr = addr;
+    s->fault_count++;
+    s->fault_ctrl &= ~NTO64_DMA_FAULT_INJECT;   /* consumed */
+    s->retry_ring = ring;
+    s->retry_queue = q;
+    if (s->fault_ctrl & NTO64_DMA_FAULT_IRQEN) {
+        msix_notify(&s->pdev, s->queues_n);
+    }
+    info_report("nto64-dma: fault @ %#" PRIx64 " (count %u)",
+                addr, s->fault_count);
 }
 
 /* One ring descriptor: +0 src, +4 dst, +8 len, +0xc flags. */
@@ -273,13 +381,22 @@ static void nto64_dma_ring_q(Nto64DmaState *s, unsigned q)
         if (!(d.flags & 1)) {
             break;
         }
-        if (d.len > s->max_xfer ||
-            !nto64_dma_xfer(s, &qq->as, d.src, d.dst, d.len,
-                            !!(d.flags & NTO64_DMA_DESC_PEER_SRC),
-                            !!(d.flags & NTO64_DMA_DESC_PEER_DST),
-                            s->bounce)) {
+        if (d.len > s->max_xfer) {
             s->status = NTO64_DMA_ST_ERR;
             return;
+        }
+        switch (nto64_dma_xfer(s, &qq->as, d.src, d.dst, d.len,
+                               !!(d.flags & NTO64_DMA_DESC_PEER_SRC),
+                               !!(d.flags & NTO64_DMA_DESC_PEER_DST),
+                               s->bounce)) {
+        case NTO64_DMA_FAULT:
+            nto64_dma_latch_fault(s, s->fault_addr, true, q);
+            return;
+        case NTO64_DMA_ERR:
+            s->status = NTO64_DMA_ST_ERR;
+            return;
+        default:
+            break;
         }
         d.flags |= 2;
         if (address_space_write(&qq->as, daddr + 12,
@@ -302,7 +419,7 @@ static void nto64_dma_ring_q(Nto64DmaState *s, unsigned q)
     s->status = NTO64_DMA_ST_DONE;
 }
 
-/* Snapshot the register-set bulk transfer parameters at start. */
+/* Snapshot the register-set bulk transfer parameters at start/retry. */
 static void nto64_dma_bulk_begin(Nto64DmaState *s)
 {
     s->bulk_len = MIN(s->size, s->max_xfer);
@@ -325,6 +442,7 @@ static void nto64_dma_bulk_begin(Nto64DmaState *s)
 static void nto64_dma_bh(void *opaque)
 {
     Nto64DmaState *s = opaque;
+    Nto64DmaResult r;
     unsigned burst;
 
     if (!(s->status & NTO64_DMA_ST_BUSY)) {
@@ -335,6 +453,17 @@ static void nto64_dma_bh(void *opaque)
         s->queue_start = false;
         if (s->ring_queue < s->queues_n) {
             nto64_dma_ring_q(s, s->ring_queue);
+        } else {
+            s->status = NTO64_DMA_ST_ERR;
+        }
+        return;
+    }
+
+    if (s->retry_ring) {
+        /* resolve/retry: re-run the faulted ring batch */
+        s->retry_ring = false;
+        if (s->retry_queue < s->queues_n) {
+            nto64_dma_ring_q(s, s->retry_queue);
         } else {
             s->status = NTO64_DMA_ST_ERR;
         }
@@ -357,12 +486,16 @@ static void nto64_dma_bh(void *opaque)
         hwaddr dst = s->bulk_dst + s->bulk_off;
 
         if (s->bulk_p2p) {
-            if (!nto64_dma_copy_peer(s, src, dst, chunk)) {
-                s->status = NTO64_DMA_ST_ERR;
-                return;
-            }
-        } else if (!nto64_dma_copy_as(&s->dma_as, src, dst, chunk,
-                                      s->bounce)) {
+            r = nto64_dma_copy_peer(s, src, dst, chunk);
+        } else {
+            r = nto64_dma_copy_checked(s, &s->dma_as, src, dst, chunk,
+                                       false, false, s->bounce);
+        }
+        if (r == NTO64_DMA_FAULT) {
+            nto64_dma_latch_fault(s, s->fault_addr, false, 0);
+            return;
+        }
+        if (r != NTO64_DMA_OK) {
             s->status = NTO64_DMA_ST_ERR;
             return;
         }
@@ -505,6 +638,22 @@ static uint64_t nto64_dma_read(void *opaque, hwaddr addr, unsigned size)
         return (uint32_t)s->p2p_bytes;
     case 0x70:
         return (uint32_t)(s->p2p_bytes >> 32);
+    case 0x74:
+        return s->fault_ctrl;
+    case 0x78:
+        return s->fault_status;
+    case 0x7c:
+        return (uint32_t)s->fault_addr;
+    case 0x80:
+        return (uint32_t)(s->fault_addr >> 32);
+    case 0x84:
+        return s->fault_count;
+    case 0x88:
+        return (uint32_t)s->fault_win_base;
+    case 0x8c:
+        return (uint32_t)(s->fault_win_base >> 32);
+    case 0x90:
+        return s->fault_win_size;
     default:
         return 0;
     }
@@ -587,6 +736,38 @@ static void nto64_dma_write(void *opaque, hwaddr addr,
         if (val & 1) {
             nto64_dma_start_queue(s, s->qselect);
         }
+        break;
+    case 0x74:
+        s->fault_ctrl = (uint32_t)val &
+            (NTO64_DMA_FAULT_WIN | NTO64_DMA_FAULT_INJECT |
+             NTO64_DMA_FAULT_IRQEN);
+        if (val & NTO64_DMA_FAULT_RESOLVE) {
+            if (s->fault_status & NTO64_DMA_FST_PENDING) {
+                s->fault_status = 0;
+                if (!s->retry_ring) {
+                    /*
+                     * bulk fault: re-snapshot the register-set op and
+                     * retry it from the start
+                     */
+                    nto64_dma_bulk_begin(s);
+                }
+                s->status = NTO64_DMA_ST_BUSY;
+                qemu_bh_schedule(s->bh);
+                info_report("nto64-dma: fault resolved, retrying");
+            }
+        }
+        break;
+    case 0x88:
+        s->fault_win_base = (s->fault_win_base &
+                             0xffffffff00000000ULL) | (uint32_t)val;
+        break;
+    case 0x8c:
+        s->fault_win_base = (s->fault_win_base &
+                             0x00000000ffffffffULL) |
+                            ((uint64_t)val << 32);
+        break;
+    case 0x90:
+        s->fault_win_size = (uint32_t)val;
         break;
     default:
         break;
@@ -693,14 +874,16 @@ static void nto64_dma_realize(PCIDevice *pci_dev, Error **errp)
                           "nto64-dma-ctrl", NTO64_DMA_CTRL_SIZE);
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->ctrl);
 
-    if (msix_init_exclusive_bar(pci_dev, s->queues_n, 1, errp)) {
+    /* queues_n completion vectors + one fault vector */
+    if (msix_init_exclusive_bar(pci_dev, s->queues_n + 1, 1, errp)) {
         return;
     }
-    for (i = 0; i < s->queues_n; i++) {
+    for (i = 0; i <= s->queues_n; i++) {
         msix_vector_use(pci_dev, i);
     }
     info_report("nto64-dma: ready (%u queues, queue i -> vCPU i; "
-                "bulk DMA AS bound to vCPU %u)", s->queues_n, s->node);
+                "bulk DMA AS bound to vCPU %u; fault vector %u)",
+                s->queues_n, s->node, s->queues_n);
 }
 
 static void nto64_dma_exit(PCIDevice *pci_dev)

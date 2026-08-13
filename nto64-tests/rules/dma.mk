@@ -15,6 +15,11 @@ run-p2ptest: p2ptest
 	    -device nto64-dma,peer=vram,queues=1 \
 	    -kernel p2ptest -serial stdio -display none -no-reboot
 
+run-pritest: pritest
+	$(QEMU) -machine q35 -m 128 \
+	    -device nto64-dma,queues=1 \
+	    -kernel pritest -serial stdio -display none -no-reboot
+
 
 EXTRA_BUILT +=
-RUNTARGETS += run-iommutest run-p2ptest
+RUNTARGETS += run-iommutest run-p2ptest run-pritest

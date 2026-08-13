@@ -379,3 +379,24 @@ Run ``make run-p2ptest`` with two endpoints on one bus.
    off the same root bus.  What is covered is the failure a driver
    actually sees: a BAR mapped into another BAR reading back zeros
    without an error.
+
+
+Device page faults
+~~~~~~~~~~~~~~~~~~
+
+``nto64-dma`` can fault on a guest translation: a window at BAR0
+``0x88``/``0x8c``/``0x90`` (base, limit, enable), inject-on-next /
+resolve-retry / fault-IRQ-enable at ``0x74``, fault status ``0x78``,
+faulting address ``0x7c``/``0x80``, fault count ``0x84`` and status bit3,
+with one extra MSI-X vector carrying the fault interrupt.
+
+Run ``make run-pritest``: arm the window, take the fault on its own
+vector, read back the address and status, fix the mapping, write resolve
+and verify that the interrupted transfer is retried to completion.
+
+.. note::
+   This is PRI-like, not PRI: there is no page request queue, no group
+   response and no invalidation semantics beyond the retry.  The detail
+   that matters for a driver is partial progress - a chunk overlapping the
+   window faults *after* the earlier chunks have completed and been
+   counted, so a fault does not mean "nothing happened".
