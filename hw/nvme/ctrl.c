@@ -213,6 +213,51 @@
 #include "dif.h"
 #include "trace.h"
 
+/*
+ * nto64 testbed fault hooks: a surprise-unplug trigger and
+ * PCIe link downgrade/mismatch knob for the NVMe fault slice.  The
+ * trigger is a guest write of NTO64_UNPLUG_MAGIC to the reserved BAR0
+ * offset NTO64_UNPLUG_REG (inside rsvd92); from then on the device is
+ * "gone": MMIO reads return 0xffffffff, config reads return 0xff, and
+ * completions are dropped (commands already in flight never complete).
+ */
+#define NTO64_UNPLUG_REG   0x5c
+#define NTO64_UNPLUG_MAGIC 0x4e544f55 /* "NTOU" */
+#define NTO64_RDYLIE_REG   0x60
+/*
+ * "NTRL" - arm the RDY-lie for the next nto64-rdy-lie-start controller starts
+ * (BIOS-proof: SeaBIOS's own NVMe probe would otherwise consume the count)
+ */
+#define NTO64_RDYLIE_MAGIC 0x4e54524c
+/*
+ * guest-armed AER + namespace edge-state hooks.
+ * Each magic is written by the test driver to a reserved BAR0 offset;
+ * a zero property keeps the arm a no-op, so SeaBIOS's NVMe probe can
+ * never consume them.
+ */
+#define NTO64_SMART_REG    0x64
+#define NTO64_SMART_MAGIC  0x4e544153 /* "NTAS" - arm one SMART AER */
+#define NTO64_NSNR_REG     0x68
+/*
+ * "NTNR" - arm the NS-not-ready window (nto64-ns-not-ready-ms)
+ */
+#define NTO64_NSNR_MAGIC   0x4e544e52
+#define NTO64_FMTS_REG     0x6c
+/*
+ * "NTFS" - arm the Format NVM stall (nto64-format-stall-ms)
+ */
+#define NTO64_FMTS_MAGIC   0x4e544653
+#define NTO64_WP_REG       0x70
+/*
+ * "NTWP" - arm the write-protect window (nto64-wp-ms)
+ */
+#define NTO64_WP_MAGIC     0x4e545750
+#define NTO64_RESV_REG     0x74
+/*
+ * "NTRC" - arm the reservation-conflict window (nto64-resv-conflict-ms)
+ */
+#define NTO64_RESV_MAGIC   0x4e545243
+
 #define NVME_MAX_IOQPAIRS 0xffff
 #define NVME_DB_SIZE  4
 #define NVME_SPEC_VER 0x00010400
@@ -318,6 +363,7 @@ static const uint32_t nvme_cse_iocs_zoned_default[256] = {
 
 static void nvme_process_sq(void *opaque);
 static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst);
+static void nvme_nto64_arm_attach(NvmeCtrl *n, uint32_t ms);
 static inline uint64_t nvme_get_timestamp(const NvmeCtrl *n);
 
 static uint16_t nvme_sqid(NvmeRequest *req)
@@ -1552,6 +1598,30 @@ static void nvme_post_cqes(void *opaque)
 
 static void nvme_enqueue_req_completion(NvmeCQueue *cq, NvmeRequest *req)
 {
+    NvmeCtrl *n = cq->ctrl;
+
+    if (n->nto64_removed || n->nto64_wedged || n->nto64_hung ||
+        n->nto64_stalled) {
+        /*
+         * surprise unplug, media-recovery wedge, start hang, or the
+         * MMIO-alive/DMA-dead stall: the controller is not servicing,
+         * completions never arrive (an Abort sent while wedged is also
+         * swallowed here)
+         */
+        return;
+    }
+    if (n->nto64_dead_cq && cq->cqid == n->nto64_dead_cq) {
+        /*
+         * the dead CQ never posts the CQE, but the
+         * request is recycled to the SQ pool so the queue lifecycle
+         * (delete/recreate) stays intact - a driver that bounds its
+         * CQ poll, deletes the queue pair and recreates it recovers
+         */
+        QTAILQ_REMOVE(&req->sq->out_req_list, req, entry);
+        QTAILQ_INSERT_TAIL(&req->sq->req_list, req, entry);
+        return;
+    }
+
     assert(cq->cqid == req->sq->cqid);
     trace_pci_nvme_enqueue_req_completion(nvme_cid(req), cq->cqid,
                                           le32_to_cpu(req->cqe.result),
@@ -1665,6 +1735,38 @@ static void nvme_smart_event(NvmeCtrl *n, uint8_t event)
     }
 
     nvme_enqueue_event(n, NVME_AER_TYPE_SMART, aer_info, NVME_LOG_SMART_INFO);
+}
+
+/*
+ * nto64 testbed: guest-armed SMART AER trigger.
+ * Each arm injects the next unset SMART critical-warning bit
+ * (reliability, then spare, then temperature) and posts the matching
+ * asynchronous event - gated by the guest's Async Event Config, so a
+ * driver that never enabled AEC sees nothing, exactly like a real
+ * controller.  Reading the SMART log with RAE=0 clears the event
+ * mask, so repeated arms prove the full AER cycle.
+ */
+static void nvme_nto64_smart_arm(NvmeCtrl *n)
+{
+    static const uint8_t order[] = { NVME_SMART_RELIABILITY,
+                                     NVME_SMART_SPARE,
+                                     NVME_SMART_TEMPERATURE };
+    uint8_t old = n->smart_critical_warning;
+    uint8_t event = 0;
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(order); i++) {
+        if (!(old & order[i])) {
+            event = order[i];
+            break;
+        }
+    }
+    if (!event) {
+        n->smart_critical_warning = 0;
+        event = NVME_SMART_RELIABILITY;
+    }
+    n->smart_critical_warning |= event;
+    nvme_smart_event(n, event);
 }
 
 static void nvme_clear_events(NvmeCtrl *n, uint8_t event_type)
@@ -2631,6 +2733,18 @@ static uint16_t nvme_dsm(NvmeCtrl *n, NvmeRequest *req)
     uint16_t status = NVME_SUCCESS;
 
     trace_pci_nvme_dsm(nr, attr);
+
+    /*
+     * nto64 testbed: the armed write-protect
+     * window - data-modifying commands fail with Namespace is Write
+     * Protected (0x0020, NVM Express Base 2.4 Figure 103) while the
+     * namespace is read-only; reads still work.  The test models a
+     * transient protection window, so DNR stays 0 (the bounded retry
+     * lands once the window expires).
+     */
+    if (n->nto64_wp) {
+        return NVME_NS_WRITE_PROTECTED;
+    }
 
     if (attr & NVME_DSMGMT_AD) {
         NvmeDSMAIOCB *iocb = blk_aio_get(&nvme_dsm_aiocb_info, ns->blkconf.blk,
@@ -3729,6 +3843,15 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
     BlockBackend *blk = ns->blkconf.blk;
     uint16_t status;
 
+    /*
+     * nto64 testbed: the armed write-protect
+     * window - writes fail with Namespace is Write Protected while
+     * the namespace is read-only; reads still work.
+     */
+    if (n->nto64_wp) {
+        return NVME_NS_WRITE_PROTECTED;
+    }
+
     if (nvme_ns_ext(ns) && !(NVME_ID_CTRL_CTRATT_MEM(n->id_ctrl.ctratt))) {
         mapped_size += nvme_m2b(ns, nlb);
 
@@ -4608,6 +4731,40 @@ static uint16_t nvme_io_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
 
 static uint16_t __nvme_io_cmd_nvm(NvmeCtrl *n, NvmeRequest *req)
 {
+    if (req->cmd.opcode == NVME_CMD_READ) {
+        NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
+        uint64_t slba = le64_to_cpu(rw->slba);
+        uint32_t nlb = le16_to_cpu(rw->nlb) + 1;
+
+        if (!n->nto64_wedged && n->nto64_stuck_lba != UINT64_MAX &&
+            slba <= n->nto64_stuck_lba &&
+            n->nto64_stuck_lba < slba + nlb) {
+            /*
+             * nto64 testbed: the controller wedges while recovering
+             * the media error at this LBA - no aio, no completion, and
+             * (with the CC.EN hook) the next reset attempt kills the
+             * link.  The command hangs exactly like a real controller
+             * stuck in media-error recovery.
+             */
+            n->nto64_wedged = true;
+            return 0;
+        }
+        if (!n->nto64_stalled && n->nto64_stall_lba != UINT64_MAX &&
+            slba <= n->nto64_stall_lba &&
+            n->nto64_stall_lba < slba + nlb) {
+            /*
+             * nto64 testbed: the DMA path dies
+             * this transfer - no aio, no completion - while MMIO/CSTS
+             * stay alive (the "MMIO alive, DMA dead" partial wedge).
+             * Unlike the stuck-lba wedge, a controller reset REVIVES
+             * the controller, so the driver must bound the wait, reset,
+             * re-initialize and prove the data path again.
+             */
+            n->nto64_stalled = true;
+            return 0;
+        }
+    }
+
     switch (req->cmd.opcode) {
     case NVME_CMD_WRITE:
         return nvme_write(n, req);
@@ -4700,6 +4857,28 @@ static uint16_t nvme_io_cmd(NvmeCtrl *n, NvmeRequest *req)
     ns = nvme_ns(n, nsid);
     if (unlikely(!ns)) {
         return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    /*
+     * nto64 testbed: the armed NS-not-ready
+     * window - every I/O command to the namespace fails with
+     * NVME_NS_NOT_READY until the window expires; the driver must
+     * bound its retries and land once the namespace is ready.
+     */
+    if (n->nto64_ns_not_ready) {
+        return NVME_NS_NOT_READY;
+    }
+
+    /*
+     * nto64 testbed: Reservation Conflict while
+     * another controller in the subsystem holds a reservation on the
+     * shared namespace - NVME_NS_RESV_CONFLICT (0x0083) with DNR=0 so
+     * the command may succeed if resubmitted once the reservation is
+     * released.
+     */
+    if (ns->resv_holder != NVME_CNTLID_NONE &&
+        ns->resv_holder != n->cntlid) {
+        return NVME_NS_RESV_CONFLICT;
     }
 
     if (ns->status) {
@@ -5509,6 +5688,13 @@ static void nvme_free_cq(NvmeCQueue *cq, NvmeCtrl *n)
     PCIDevice *pci = PCI_DEVICE(n);
     uint16_t offset = (cq->cqid << 3) + (1 << 2);
 
+    /*
+     * nto64 testbed: deleting the dead CQ clears
+     * the fault - the driver's delete/recreate recovery revives it.
+     */
+    if (n->nto64_dead_cq == cq->cqid) {
+        n->nto64_dead_cq = 0;
+    }
     n->cq[cq->cqid] = NULL;
     qemu_bh_delete(cq->bh);
     if (cq->ioeventfd_enabled) {
@@ -7037,12 +7223,98 @@ static void nvme_do_format(NvmeFormatAIOCB *iocb)
     }
 
     iocb->ns->status = NVME_FORMAT_IN_PROGRESS;
+    if (n->nto64_fmt_armed && !n->nto64_fmt_pending) {
+        /*
+         * nto64 testbed: hold the Format NVM in
+         * flight for the stall window so the guest can observe I/O
+         * failing with NVME_FORMAT_IN_PROGRESS, then release it (the
+         * format proceeds and the namespace becomes writable again).
+         */
+        n->nto64_fmt_armed = false;
+        n->nto64_fmt_pending = iocb;
+        timer_mod(n->nto64_fmt_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)n->nto64_format_stall_ms * SCALE_MS);
+        return;
+    }
     nvme_format_ns_cb(iocb, 0);
     return;
 
 done:
     iocb->common.cb(iocb->common.opaque, iocb->ret);
     qemu_aio_unref(iocb);
+}
+
+/*
+ * the Format NVM stall window expires - resume the
+ * format so it completes and the namespace leaves FORMAT_IN_PROGRESS.
+ */
+static void nvme_nto64_format_release(void *opaque)
+{
+    NvmeCtrl *n = opaque;
+    NvmeFormatAIOCB *iocb = n->nto64_fmt_pending;
+
+    if (!iocb) {
+        return;
+    }
+    n->nto64_fmt_pending = NULL;
+    nvme_format_ns_cb(iocb, 0);
+}
+
+/*
+ * the reservation-conflict window expires - the
+ * sibling controller's reservation on the shared namespace is
+ * released and I/O succeeds again (the driver's bounded retry lands).
+ */
+static void nvme_nto64_resv_clear_cb(void *opaque)
+{
+    NvmeCtrl *n = opaque;
+
+    if (n->nto64_resv_ns) {
+        n->nto64_resv_ns->resv_holder = NVME_CNTLID_NONE;
+        n->nto64_resv_ns = NULL;
+    }
+}
+
+/*
+ * guest-armed reservation-conflict window (NTRC).
+ * With a multi-controller subsystem the armed controller finds a
+ * sibling and marks the shared namespace as reserved by it; every I/O
+ * command from this controller then fails with NVME_NS_RESV_CONFLICT
+ * until the window expires.  Single-controller targets / zero
+ * property: no-op (BIOS-proof, same rule as the other magics).
+ */
+static void nvme_nto64_resv_arm(NvmeCtrl *n)
+{
+    NvmeSubsystem *subsys = n->subsys;
+    NvmeNamespace *ns;
+    NvmeCtrl *sibling = NULL;
+    int i;
+
+    if (!n->nto64_resv_conflict_ms || !subsys) {
+        return;
+    }
+
+    ns = nvme_ns(n, 1);
+    if (!ns || !ns->subsys || ns->ctrl) {
+        return;    /* shared subsystem namespaces only */
+    }
+
+    for (i = 0; i < NVME_MAX_CONTROLLERS && !sibling; i++) {
+        if (i != n->cntlid && subsys->ctrls[i] &&
+            subsys->ctrls[i] != SUBSYS_SLOT_RSVD) {
+            sibling = subsys->ctrls[i];
+        }
+    }
+    if (!sibling) {
+        return;
+    }
+
+    ns->resv_holder = sibling->cntlid;
+    n->nto64_resv_ns = ns;
+    timer_mod(n->nto64_resv_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (int64_t)n->nto64_resv_conflict_ms * SCALE_MS);
 }
 
 static uint16_t nvme_format(NvmeCtrl *n, NvmeRequest *req)
@@ -7780,6 +8052,7 @@ static void nvme_process_sq(void *opaque)
 {
     NvmeSQueue *sq = opaque;
     NvmeCtrl *n = sq->ctrl;
+
     NvmeCQueue *cq = n->cq[sq->cqid];
 
     uint16_t status;
@@ -7802,7 +8075,6 @@ static void nvme_process_sq(void *opaque)
             stl_le_p(&n->bar.csts, NVME_CSTS_FAILED);
             break;
         }
-
         atomic = nvme_get_atomic(n, &cmd);
 
         cmd_is_atomic = false;
@@ -7894,6 +8166,18 @@ static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst)
     NvmeNamespace *ns;
     int i;
 
+    if (rst == NVME_RESET_FUNCTION) {
+        /* a PCIe function reset (FLR) revives a hung controller */
+        n->nto64_hung = false;
+    }
+    /*
+     * nto64 testbed: the MMIO-alive/DMA-dead
+     * stall is revived by a controller reset (unlike the stuck-lba
+     * wedge, which dies on the reset); the dead-CQ flag is cleared
+     * when its queue is deleted below.
+     */
+    n->nto64_stalled = false;
+
     for (i = 1; i <= NVME_MAX_NAMESPACES; i++) {
         ns = nvme_ns(n, i);
         if (!ns) {
@@ -7901,6 +8185,39 @@ static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst)
         }
 
         nvme_ns_drain(ns);
+    }
+
+    /*
+     * nto64 testbed: a reset releases a stalled
+     * Format NVM (it completes with Command Interrupted on the live
+     * CQ before the queues below are torn down).  Releasing the request
+     * is only half of it: nvme_do_format() set ns->status when it armed
+     * the stall, and only a format that runs to completion clears it
+     * again, so dropping the iocb alone would leave the namespace
+     * answering every later I/O with FORMAT_IN_PROGRESS (0x84, DNR=0)
+     * forever - the driver would requeue it endlessly after re-init and
+     * the reset would appear not to have recovered the controller.
+     */
+    if (n->nto64_fmt_pending) {
+        NvmeFormatAIOCB *iocb = n->nto64_fmt_pending;
+        NvmeNamespace *fmt_ns = iocb->ns;
+        n->nto64_fmt_pending = NULL;
+        n->nto64_fmt_armed = false;
+        timer_del(n->nto64_fmt_timer);
+        if (fmt_ns && fmt_ns->status == NVME_FORMAT_IN_PROGRESS) {
+            fmt_ns->status = 0x0;
+        }
+        nvme_format_ns_cb(iocb, -ECANCELED);
+    }
+
+    /*
+     * nto64 testbed: a reset releases the armed
+     * reservation-conflict window on the shared namespace.
+     */
+    if (n->nto64_resv_ns) {
+        n->nto64_resv_ns->resv_holder = NVME_CNTLID_NONE;
+        n->nto64_resv_ns = NULL;
+        timer_del(n->nto64_resv_timer);
     }
 
     for (i = 0; i < n->params.max_ioqpairs + 1; i++) {
@@ -7988,6 +8305,31 @@ static int nvme_start_ctrl(NvmeCtrl *n)
     uint32_t page_bits = NVME_CC_MPS(cc) + 12;
     uint32_t page_size = 1 << page_bits;
     NvmeSecCtrlEntry *sctrl = nvme_sctrl(n);
+
+    n->nto64_start_attempts++;
+    if (n->nto64_hang_start &&
+        n->nto64_start_attempts == n->nto64_hang_start) {
+        /*
+         * nto64 testbed: after the start-fail storm
+         * controller HANGS - MMIO reads return all-ones, writes are
+         * ignored (even CC.EN=0), and only a PCIe function reset
+         * (FLR) revives it.  The driver must escalate past the
+         * controller reset to the FLR.
+         */
+        n->nto64_hung = true;
+        return -1;
+    }
+
+    if (n->nto64_start_fail_left) {
+        /*
+         * nto64 testbed: the controller fails its first
+         * nto64-start-fail starts - CSTS goes FAILED instead of READY,
+         * the attach/reset storm.  The counter survives controller
+         * resets, so each reset retry consumes one failure.
+         */
+        n->nto64_start_fail_left--;
+        return -1;
+    }
 
     if (pci_is_vf(PCI_DEVICE(n)) && !sctrl->scs) {
         trace_pci_nvme_err_startfail_virt_state(le16_to_cpu(sctrl->nvi),
@@ -8137,6 +8479,16 @@ static void nvme_write_bar(NvmeCtrl *n, hwaddr offset, uint64_t data,
         nvme_irq_check(n);
         break;
     case NVME_REG_CC:
+        if (n->nto64_wedged) {
+            /*
+             * nto64 testbed: the wedged controller dies on the reset
+             * attempt - the link goes away (CSTS/config read all-ones,
+             * completions stop), the SSD-disappearance scenario.
+             */
+            n->nto64_removed = true;
+            nvme_nto64_arm_attach(n, n->nto64_replug_ms);
+            return;
+        }
         stl_le_p(&n->bar.cc, data);
 
         trace_pci_nvme_mmio_cfg(data & 0xffffffff);
@@ -8155,6 +8507,18 @@ static void nvme_write_bar(NvmeCtrl *n, hwaddr offset, uint64_t data,
             if (unlikely(nvme_start_ctrl(n))) {
                 trace_pci_nvme_err_startfail();
                 csts = NVME_CSTS_FAILED;
+            } else if (n->nto64_rdy_lie_left) {
+                /*
+                 * nto64 testbed: the Nth start
+                 * LIES - CC.EN=1 but CSTS.RDY never asserts (and
+                 * CSTS.FAILED is not set either; CSTS just stays 0).
+                 * The controller is actually running; the driver's
+                 * bounded start wait times out and it must reset +
+                 * retry.  Armed one-shot per start by the guest-only
+                 * NTRL magic (BIOS-proof: SeaBIOS's own NVMe probe
+                 * would consume an attempt-numbered lie).
+                 */
+                n->nto64_rdy_lie_left--;
             } else {
                 trace_pci_nvme_mmio_start_success();
                 csts = NVME_CSTS_READY;
@@ -8322,12 +8686,62 @@ static void nvme_write_bar(NvmeCtrl *n, hwaddr offset, uint64_t data,
     }
 }
 
+static void nvme_nto64_arm_attach(NvmeCtrl *n, uint32_t ms)
+{
+    if (ms) {
+        timer_mod(n->nto64_attach_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)ms * SCALE_MS);
+    }
+}
+
+static void nvme_nto64_attach_cb(void *opaque)
+{
+    NvmeCtrl *n = opaque;
+
+    /*
+     * the device (re-)attaches: config/MMIO become live again and the
+     * controller is reset so the driver re-initializes it cleanly
+     */
+    n->nto64_absent = false;
+    n->nto64_removed = false;
+    n->nto64_hung = false;
+    nvme_ctrl_reset(n, NVME_RESET_FUNCTION);
+}
+
+/*
+ * the NS-not-ready window expires - I/O to the
+ * namespace succeeds again (the driver's bounded retry lands).
+ */
+static void nvme_nto64_ns_ready_cb(void *opaque)
+{
+    NvmeCtrl *n = opaque;
+
+    n->nto64_ns_not_ready = false;
+}
+
+/*
+ * the write-protect window expires - writes to the
+ * namespace succeed again.
+ */
+static void nvme_nto64_wp_clear_cb(void *opaque)
+{
+    NvmeCtrl *n = opaque;
+
+    n->nto64_wp = false;
+}
+
 static uint64_t nvme_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
     NvmeCtrl *n = (NvmeCtrl *)opaque;
     uint8_t *ptr = (uint8_t *)&n->bar;
 
     trace_pci_nvme_mmio_read(addr, size);
+
+    if (n->nto64_absent || n->nto64_removed || n->nto64_hung) {
+        /* not attached / surprise unplug / start hang: all-ones */
+        return 0xffffffff;
+    }
 
     if (unlikely(addr & (sizeof(uint32_t) - 1))) {
         NVME_GUEST_ERR(pci_nvme_ub_mmiord_misaligned32,
@@ -8363,6 +8777,9 @@ static uint64_t nvme_mmio_read(void *opaque, hwaddr addr, unsigned size)
     if (addr == NVME_REG_PMRSTS &&
         (NVME_PMRCAP_PMRWBM(ldl_le_p(&n->bar.pmrcap)) & 0x02)) {
         memory_region_msync(&n->pmr.dev->mr, 0, n->pmr.dev->size);
+    }
+
+    if (addr == NVME_REG_CSTS) {
     }
 
     return ldn_le_p(ptr + addr, size);
@@ -8520,6 +8937,64 @@ static void nvme_mmio_write(void *opaque, hwaddr addr, uint64_t data,
     NvmeCtrl *n = (NvmeCtrl *)opaque;
 
     trace_pci_nvme_mmio_write(addr, data, size);
+
+    if (!n->nto64_removed && addr == NTO64_UNPLUG_REG &&
+        size == sizeof(uint32_t) && data == NTO64_UNPLUG_MAGIC) {
+        n->nto64_removed = true;
+        info_report("nto64: nvme surprise unplug triggered");
+        nvme_nto64_arm_attach(n, n->nto64_replug_ms);
+        return;
+    }
+    if (!n->nto64_removed && addr == NTO64_RDYLIE_REG &&
+        size == sizeof(uint32_t) && data == NTO64_RDYLIE_MAGIC) {
+        n->nto64_rdy_lie_left = n->nto64_rdy_lie_start;
+        return;
+    }
+    if (!n->nto64_removed && addr == NTO64_SMART_REG &&
+        size == sizeof(uint32_t) && data == NTO64_SMART_MAGIC) {
+        nvme_nto64_smart_arm(n);
+        return;
+    }
+    if (!n->nto64_removed && addr == NTO64_NSNR_REG &&
+        size == sizeof(uint32_t) && data == NTO64_NSNR_MAGIC) {
+        if (n->nto64_ns_not_ready_ms) {
+            n->nto64_ns_not_ready = true;
+            timer_mod(n->nto64_ns_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      (int64_t)n->nto64_ns_not_ready_ms * SCALE_MS);
+        }
+        return;
+    }
+    if (!n->nto64_removed && addr == NTO64_FMTS_REG &&
+        size == sizeof(uint32_t) && data == NTO64_FMTS_MAGIC) {
+        if (n->nto64_format_stall_ms) {
+            n->nto64_fmt_armed = true;
+        }
+        return;
+    }
+    if (!n->nto64_removed && addr == NTO64_WP_REG &&
+        size == sizeof(uint32_t) && data == NTO64_WP_MAGIC) {
+        if (n->nto64_wp_ms) {
+            n->nto64_wp = true;
+            timer_mod(n->nto64_wp_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      (int64_t)n->nto64_wp_ms * SCALE_MS);
+        }
+        return;
+    }
+    if (!n->nto64_removed && addr == NTO64_RESV_REG &&
+        size == sizeof(uint32_t) && data == NTO64_RESV_MAGIC) {
+        nvme_nto64_resv_arm(n);
+        return;
+    }
+
+    if (n->nto64_absent || n->nto64_removed || n->nto64_hung) {
+        /*
+         * not attached / surprise unplug / start hang: all MMIO writes are dead
+         * (a hung controller cannot even process CC.EN=0)
+         */
+        return;
+    }
 
     if (pci_is_vf(PCI_DEVICE(n)) && !nvme_sctrl(n)->scs &&
         addr != NVME_REG_CSTS) {
@@ -8948,6 +9423,8 @@ static bool nvme_init_pci(NvmeCtrl *n, PCIDevice *pci_dev, Error **errp)
     unsigned nr_vectors;
     int ret;
 
+    n->nto64_start_fail_left = n->nto64_start_fail;
+
     pci_conf[PCI_INTERRUPT_PIN] = pci_is_vf(pci_dev) ? 0 : 1;
     pci_config_set_prog_interface(pci_conf, 0x2);
 
@@ -8962,6 +9439,21 @@ static bool nvme_init_pci(NvmeCtrl *n, PCIDevice *pci_dev, Error **errp)
     pci_config_set_class(pci_conf, PCI_CLASS_STORAGE_EXPRESS);
     nvme_add_pm_capability(pci_dev, 0x60);
     pcie_endpoint_cap_init(pci_dev, 0x80);
+    if (n->nto64_link_gen > 1 && n->nto64_link_gen <= 3 &&
+        pci_dev->exp.exp_cap) {
+        /*
+         * Link downgrade/mismatch knob: advertise a higher max link
+         * speed in LNKCAP but leave the negotiated LNKSTA speed at
+         * gen1, so the guest sees a downgraded link (QEMU does not
+         * model link training; this is the observable mismatch).
+         */
+        uint8_t *exp_cap = pci_dev->config + pci_dev->exp.exp_cap;
+
+        pci_long_test_and_clear_mask(exp_cap + PCI_EXP_LNKCAP,
+                                     PCI_EXP_LNKCAP_SLS);
+        pci_long_test_and_set_mask(exp_cap + PCI_EXP_LNKCAP,
+                                   QEMU_PCI_EXP_LNKCAP_MLS(n->nto64_link_gen));
+    }
     pcie_cap_flr_init(pci_dev);
     if (n->params.sriov_max_vfs) {
         pcie_ari_init(pci_dev, 0x100);
@@ -9303,6 +9795,22 @@ static void nvme_realize(PCIDevice *pci_dev, Error **errp)
     }
     nvme_init_ctrl(n, pci_dev);
 
+    n->nto64_attach_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                         nvme_nto64_attach_cb, n);
+    n->nto64_ns_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     nvme_nto64_ns_ready_cb, n);
+    n->nto64_fmt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      nvme_nto64_format_release, n);
+    n->nto64_wp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     nvme_nto64_wp_clear_cb, n);
+    n->nto64_resv_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       nvme_nto64_resv_clear_cb, n);
+    if (n->nto64_late_attach_ms) {
+        /* the device starts ABSENT and hot-plugs in after the delay */
+        n->nto64_absent = true;
+        nvme_nto64_arm_attach(n, n->nto64_late_attach_ms);
+    }
+
     /* setup a namespace if the controller drive property was given */
     if (n->namespace.blkconf.blk) {
         ns = &n->namespace;
@@ -9323,7 +9831,13 @@ static void nvme_exit(PCIDevice *pci_dev)
     NvmeNamespace *ns;
     int i;
 
+    timer_free(n->nto64_attach_timer);
+
     nvme_ctrl_reset(n, NVME_RESET_FUNCTION);
+    timer_free(n->nto64_ns_timer);
+    timer_free(n->nto64_fmt_timer);
+    timer_free(n->nto64_wp_timer);
+    timer_free(n->nto64_resv_timer);
 
     for (i = 1; i <= NVME_MAX_NAMESPACES; i++) {
         ns = nvme_ns(n, i);
@@ -9406,6 +9920,26 @@ static const Property nvme_props[] = {
     DEFINE_PROP_UINT16("spdm_port", PCIDevice, spdm_port, 0),
     DEFINE_PROP_SPDM_TRANS("spdm_trans", PCIDevice, spdm_trans,
                            SPDM_SOCKET_TRANSPORT_TYPE_PCI_DOE),
+    DEFINE_PROP_UINT8("nto64-link-gen", NvmeCtrl, nto64_link_gen, 1),
+    DEFINE_PROP_UINT64("nto64-stuck-lba", NvmeCtrl, nto64_stuck_lba,
+                       UINT64_MAX),
+    DEFINE_PROP_UINT32("nto64-start-fail", NvmeCtrl, nto64_start_fail, 0),
+    DEFINE_PROP_UINT32("nto64-hang-start", NvmeCtrl, nto64_hang_start, 0),
+    DEFINE_PROP_UINT32("nto64-late-attach-ms", NvmeCtrl,
+                       nto64_late_attach_ms, 0),
+    DEFINE_PROP_UINT32("nto64-replug-ms", NvmeCtrl, nto64_replug_ms, 0),
+    DEFINE_PROP_UINT32("nto64-rdy-lie-start", NvmeCtrl,
+                       nto64_rdy_lie_start, 0),
+    DEFINE_PROP_UINT64("nto64-stall-lba", NvmeCtrl, nto64_stall_lba,
+                       UINT64_MAX),
+    DEFINE_PROP_UINT16("nto64-dead-cq", NvmeCtrl, nto64_dead_cq, 0),
+    DEFINE_PROP_UINT32("nto64-ns-not-ready-ms", NvmeCtrl,
+                       nto64_ns_not_ready_ms, 0),
+    DEFINE_PROP_UINT32("nto64-format-stall-ms", NvmeCtrl,
+                       nto64_format_stall_ms, 0),
+    DEFINE_PROP_UINT32("nto64-wp-ms", NvmeCtrl, nto64_wp_ms, 0),
+    DEFINE_PROP_UINT32("nto64-resv-conflict-ms", NvmeCtrl,
+                       nto64_resv_conflict_ms, 0),
     DEFINE_PROP_BOOL("ctratt.mem", NvmeCtrl, params.ctratt.mem, false),
     DEFINE_PROP_BOOL("atomic.dn", NvmeCtrl, params.atomic_dn, 0),
     DEFINE_PROP_UINT16("atomic.awun", NvmeCtrl, params.atomic_awun, 0),
@@ -9494,6 +10028,11 @@ static void nvme_pci_write_config(PCIDevice *dev, uint32_t address,
 static uint32_t nvme_pci_read_config(PCIDevice *dev, uint32_t address, int len)
 {
     uint32_t val;
+
+    if (NVME(dev)->nto64_absent || NVME(dev)->nto64_removed) {
+        /* not attached / surprise unplug: config reads all-ones */
+        return len == 4 ? 0xffffffff : (len == 2 ? 0xffff : 0xff);
+    }
 
     if (dev->spdm_port && pcie_find_capability(dev, PCI_EXT_CAP_ID_DOE) &&
         (dev->spdm_trans == SPDM_SOCKET_TRANSPORT_TYPE_PCI_DOE)) {

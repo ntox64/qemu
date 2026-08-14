@@ -667,6 +667,12 @@ int nvme_ns_setup(NvmeNamespace *ns, Error **errp)
         return -1;
     }
 
+    /*
+     * nto64 testbed: the reservation-conflict
+     * holder starts free on every namespace.
+     */
+    ns->resv_holder = NVME_CNTLID_NONE;
+
     if (nvme_ns_init_blk(ns, errp)) {
         return -1;
     }

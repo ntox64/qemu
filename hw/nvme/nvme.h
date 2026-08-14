@@ -41,6 +41,7 @@ QEMU_BUILD_BUG_ON(NVME_MAX_NAMESPACES > NVME_NSID_BROADCAST - 1);
 
 typedef struct NvmeCtrl NvmeCtrl;
 typedef struct NvmeNamespace NvmeNamespace;
+typedef struct NvmeFormatAIOCB NvmeFormatAIOCB;
 
 #define TYPE_NVME_BUS "nvme-bus"
 OBJECT_DECLARE_SIMPLE_TYPE(NvmeBus, NVME_BUS)
@@ -53,6 +54,7 @@ typedef struct NvmeBus {
 #define NVME_SUBSYS(obj) \
     OBJECT_CHECK(NvmeSubsystem, (obj), TYPE_NVME_SUBSYS)
 #define SUBSYS_SLOT_RSVD (void *)0xFFFF
+#define NVME_CNTLID_NONE 0xffff
 
 typedef struct NvmeReclaimUnit {
     uint64_t ruamw;
@@ -250,6 +252,11 @@ typedef struct NvmeNamespace {
     size_t       lbasz;
     uint8_t      csi;
     uint16_t     status;
+    /*
+     * nto64 testbed: cntlid holding a reservation on this namespace, or
+     * NVME_CNTLID_NONE when free
+     */
+    uint16_t     resv_holder;
     int          attached;
     uint8_t      pif;
 
@@ -601,6 +608,56 @@ typedef struct NvmeCtrl {
     uint64_t    dbbuf_dbs;
     uint64_t    dbbuf_eis;
     bool        dbbuf_enabled;
+    bool        nto64_removed;
+    uint8_t     nto64_link_gen;
+    bool        nto64_wedged;
+    uint64_t    nto64_stuck_lba;
+    uint32_t    nto64_start_fail;
+    uint32_t    nto64_start_fail_left;
+    uint32_t    nto64_hang_start;
+    uint32_t    nto64_start_attempts;
+    bool        nto64_hung;
+    uint32_t    nto64_late_attach_ms;
+    uint32_t    nto64_replug_ms;
+    bool        nto64_absent;
+    QEMUTimer   *nto64_attach_timer;
+    /* spec-breaking state-machine shapes */
+    uint32_t    nto64_rdy_lie_start;   /* the N starts AFTER the guest
+                                        * arms the NTRL magic lie:
+                                        * CC.EN=1 but CSTS.RDY never
+                                        * asserts (no FAILED either) -
+                                        * the driver's bounded start
+                                        * wait must time out and it
+                                        * resets + retries (BIOS-proof:
+                                        * SeaBIOS's NVMe probe cannot
+                                        * consume the arm) */
+    uint32_t    nto64_rdy_lie_left;
+    /*
+     * a transfer over this LBA stalls the controller: MMIO/CSTS stay alive but
+     * DMA never completes; a controller reset REVIVES it
+     */
+    uint64_t    nto64_stall_lba;
+    bool        nto64_stalled;
+    /*
+     * completions for this CQ are dropped (the queue is dead) until the CQ is
+     * deleted - delete/recreate recovers
+     */
+    uint16_t    nto64_dead_cq;
+    /* AER trigger + namespace edge-state shapes */
+    QEMUTimer   *nto64_ns_timer;        /* NS-not-ready window release */
+    bool        nto64_ns_not_ready;
+    uint32_t    nto64_ns_not_ready_ms;
+    QEMUTimer   *nto64_fmt_timer;       /* Format NVM stall release */
+    bool        nto64_fmt_armed;
+    NvmeFormatAIOCB *nto64_fmt_pending;
+    uint32_t    nto64_format_stall_ms;
+    QEMUTimer   *nto64_wp_timer;        /* write-protect window release */
+    bool        nto64_wp;
+    uint32_t    nto64_wp_ms;
+    /* reservation-conflict window */
+    QEMUTimer   *nto64_resv_timer;      /* reservation-conflict window release */
+    NvmeNamespace *nto64_resv_ns;       /* shared ns holding the armed reservation */
+    uint32_t    nto64_resv_conflict_ms;
 
     struct {
         uint32_t acs[256];

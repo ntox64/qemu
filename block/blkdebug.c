@@ -58,6 +58,7 @@ typedef struct BDRVBlkdebugState {
     int state;
     QLIST_HEAD(, BlkdebugRule) rules[BLKDBG__MAX];
     QSIMPLEQ_HEAD(, BlkdebugRule) active_rules;
+    QSIMPLEQ_HEAD(, BlkdebugRule) active_latency;
     QLIST_HEAD(, BlkdebugSuspendedReq) suspended_reqs;
     QemuMutex lock;
 } BDRVBlkdebugState;
@@ -79,6 +80,7 @@ typedef struct BlkdebugSuspendedReq {
 enum {
     ACTION_INJECT_ERROR,
     ACTION_SET_STATE,
+    ACTION_LATENCY,
     ACTION_SUSPEND,
     ACTION__MAX,
 };
@@ -97,6 +99,11 @@ typedef struct BlkdebugRule {
             int64_t offset;
             int64_t delay_ns;
         } inject;
+        struct {
+            uint64_t iotype_mask;
+            int64_t offset;
+            int64_t ns;
+        } latency;
         struct {
             int new_state;
         } set_state;
@@ -173,9 +180,38 @@ static QemuOptsList set_state_opts = {
     },
 };
 
+static QemuOptsList latency_opts = {
+    .name = "latency",
+    .head = QTAILQ_HEAD_INITIALIZER(latency_opts.head),
+    .desc = {
+        {
+            .name = "event",
+            .type = QEMU_OPT_STRING,
+        },
+        {
+            .name = "state",
+            .type = QEMU_OPT_NUMBER,
+        },
+        {
+            .name = "iotype",
+            .type = QEMU_OPT_STRING,
+        },
+        {
+            .name = "sector",
+            .type = QEMU_OPT_NUMBER,
+        },
+        {
+            .name = "ns",
+            .type = QEMU_OPT_NUMBER,
+        },
+        { /* end of list */ }
+    },
+};
+
 static QemuOptsList *config_groups[] = {
     &inject_error_opts,
     &set_state_opts,
+    &latency_opts,
     NULL
 };
 
@@ -254,6 +290,33 @@ static int add_rule(void *opaque, QemuOpts *opts, Error **errp)
             qemu_opt_get_number(opts, "new_state", 0);
         break;
 
+    case ACTION_LATENCY:
+        rule->options.latency.ns = qemu_opt_get_number(opts, "ns", 0);
+        sector = qemu_opt_get_number(opts, "sector", -1);
+        rule->options.latency.offset =
+            sector == -1 ? -1 : sector * BDRV_SECTOR_SIZE;
+
+        iotype = qapi_enum_parse(&BlkdebugIOType_lookup,
+                                 qemu_opt_get(opts, "iotype"),
+                                 BLKDEBUG_IO_TYPE__MAX, &local_error);
+        if (local_error) {
+            error_propagate(errp, local_error);
+            g_free(rule);
+            return -1;
+        }
+        if (iotype != BLKDEBUG_IO_TYPE__MAX) {
+            rule->options.latency.iotype_mask = (1ull << iotype);
+        } else {
+            /* Apply the default */
+            rule->options.latency.iotype_mask =
+                (1ull << BLKDEBUG_IO_TYPE_READ)
+                | (1ull << BLKDEBUG_IO_TYPE_WRITE)
+                | (1ull << BLKDEBUG_IO_TYPE_WRITE_ZEROES)
+                | (1ull << BLKDEBUG_IO_TYPE_DISCARD)
+                | (1ull << BLKDEBUG_IO_TYPE_FLUSH);
+        }
+        break;
+
     case ACTION_SUSPEND:
         rule->options.suspend.tag =
             g_strdup(qemu_opt_get(opts, "tag"));
@@ -327,10 +390,19 @@ static int read_config(BDRVBlkdebugState *s, const char *filename,
         goto fail;
     }
 
+    d.action = ACTION_LATENCY;
+    qemu_opts_foreach(&latency_opts, add_rule, &d, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        ret = -EINVAL;
+        goto fail;
+    }
+
     ret = 0;
 fail:
     qemu_opts_reset(&inject_error_opts);
     qemu_opts_reset(&set_state_opts);
+    qemu_opts_reset(&latency_opts);
     if (f) {
         fclose(f);
     }
@@ -643,17 +715,54 @@ static int coroutine_fn rule_check(BlockDriverState *bs, uint64_t offset,
     return -error;
 }
 
+static int64_t coroutine_fn latency_check(BlockDriverState *bs,
+                                          uint64_t offset, uint64_t bytes,
+                                          BlkdebugIOType iotype)
+{
+    BDRVBlkdebugState *s = bs->opaque;
+    BlkdebugRule *rule = NULL;
+    int64_t total_ns = 0;
+
+    qemu_mutex_lock(&s->lock);
+    QSIMPLEQ_FOREACH(rule, &s->active_latency, active_next) {
+        uint64_t lat_offset = rule->options.latency.offset;
+
+        if ((lat_offset == -1 ||
+             (bytes && lat_offset >= offset &&
+              lat_offset < offset + bytes)) &&
+            (rule->options.latency.iotype_mask & (1ull << iotype)))
+        {
+            total_ns += rule->options.latency.ns;
+        }
+    }
+    qemu_mutex_unlock(&s->lock);
+
+    return total_ns;
+}
+
 static int coroutine_fn GRAPH_RDLOCK
 blkdebug_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
                    QEMUIOVector *qiov, BdrvRequestFlags flags)
 {
     int err;
+    int64_t lat;
 
     /* Sanity check block layer guarantees */
     assert(QEMU_IS_ALIGNED(offset, bs->bl.request_alignment));
     assert(QEMU_IS_ALIGNED(bytes, bs->bl.request_alignment));
     if (bs->bl.max_transfer) {
         assert(bytes <= bs->bl.max_transfer);
+    }
+
+    /*
+     * Delay BEFORE the error check: a sector with both a latency and
+     * an inject-error rule models a drive that retries internally for
+     * seconds and THEN reports the media error (or succeeds on the
+     * retry) - the error must not win before the delay.
+     */
+    lat = latency_check(bs, offset, bytes, BLKDEBUG_IO_TYPE_READ);
+    if (lat) {
+        qemu_co_sleep_ns(QEMU_CLOCK_REALTIME, lat);
     }
 
     err = rule_check(bs, offset, bytes, BLKDEBUG_IO_TYPE_READ);
@@ -669,6 +778,7 @@ blkdebug_co_pwritev(BlockDriverState *bs, int64_t offset, int64_t bytes,
                     QEMUIOVector *qiov, BdrvRequestFlags flags)
 {
     int err;
+    int64_t lat;
 
     /* Sanity check block layer guarantees */
     assert(QEMU_IS_ALIGNED(offset, bs->bl.request_alignment));
@@ -682,15 +792,26 @@ blkdebug_co_pwritev(BlockDriverState *bs, int64_t offset, int64_t bytes,
         return err;
     }
 
+    lat = latency_check(bs, offset, bytes, BLKDEBUG_IO_TYPE_WRITE);
+    if (lat) {
+        qemu_co_sleep_ns(QEMU_CLOCK_REALTIME, lat);
+    }
+
     return bdrv_co_pwritev(bs->file, offset, bytes, qiov, flags);
 }
 
 static int GRAPH_RDLOCK coroutine_fn blkdebug_co_flush(BlockDriverState *bs)
 {
     int err = rule_check(bs, 0, 0, BLKDEBUG_IO_TYPE_FLUSH);
+    int64_t lat;
 
     if (err) {
         return err;
+    }
+
+    lat = latency_check(bs, 0, 0, BLKDEBUG_IO_TYPE_FLUSH);
+    if (lat) {
+        qemu_co_sleep_ns(QEMU_CLOCK_REALTIME, lat);
     }
 
     return bdrv_co_flush(bs->file->bs);
@@ -703,6 +824,7 @@ blkdebug_co_pwrite_zeroes(BlockDriverState *bs, int64_t offset, int64_t bytes,
     uint32_t align = MAX(bs->bl.request_alignment,
                          bs->bl.pwrite_zeroes_alignment);
     int err;
+    int64_t lat;
 
     /* Only pass through requests that are larger than requested
      * preferred alignment (so that we test the fallback to writes on
@@ -726,6 +848,11 @@ blkdebug_co_pwrite_zeroes(BlockDriverState *bs, int64_t offset, int64_t bytes,
         return err;
     }
 
+    lat = latency_check(bs, offset, bytes, BLKDEBUG_IO_TYPE_WRITE_ZEROES);
+    if (lat) {
+        qemu_co_sleep_ns(QEMU_CLOCK_REALTIME, lat);
+    }
+
     return bdrv_co_pwrite_zeroes(bs->file, offset, bytes, flags);
 }
 
@@ -734,6 +861,7 @@ blkdebug_co_pdiscard(BlockDriverState *bs, int64_t offset, int64_t bytes)
 {
     uint32_t align = bs->bl.pdiscard_alignment;
     int err;
+    int64_t lat;
 
     /* Only pass through requests that are larger than requested
      * minimum alignment, and ensure that unaligned requests do not
@@ -758,6 +886,11 @@ blkdebug_co_pdiscard(BlockDriverState *bs, int64_t offset, int64_t bytes)
     err = rule_check(bs, offset, bytes, BLKDEBUG_IO_TYPE_DISCARD);
     if (err) {
         return err;
+    }
+
+    lat = latency_check(bs, offset, bytes, BLKDEBUG_IO_TYPE_DISCARD);
+    if (lat) {
+        qemu_co_sleep_ns(QEMU_CLOCK_REALTIME, lat);
     }
 
     return bdrv_co_pdiscard(bs->file, offset, bytes);
@@ -842,6 +975,13 @@ static void process_rule(BlockDriverState *bs, struct BlkdebugRule *rule,
 
     case ACTION_SET_STATE:
         *new_state = rule->options.set_state.new_state;
+        break;
+
+    case ACTION_LATENCY:
+        if (action_count[ACTION_LATENCY] == 1) {
+            QSIMPLEQ_INIT(&s->active_latency);
+        }
+        QSIMPLEQ_INSERT_HEAD(&s->active_latency, rule, active_next);
         break;
 
     case ACTION_SUSPEND:
@@ -1069,6 +1209,7 @@ static const char *const blkdebug_strong_runtime_opts[] = {
     "config",
     "inject-error.",
     "set-state.",
+    "latency.",
     "align",
     "max-transfer",
     "opt-write-zero",

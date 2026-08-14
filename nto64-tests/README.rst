@@ -601,3 +601,38 @@ with per-queue MSI-X vectors.
    and firmware state is real - SeaBIOS leaves the controller enabled with
    its own queues, so a driver that does not reset first writes enable bits
    that are already no-ops.
+
+
+NVMe fault injection, storms and namespace edge states
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Controller properties and guest-armed controls cover cold and wear
+latency, surprise unplug, a link-generation downgrade, attach, reset and
+hotplug storms, AER and namespace-not-ready, a stalled ``Format NVM``,
+write-protect, a dead completion queue that never posts, a dead DMA path
+behind a live MMIO one, and reservation conflict across a
+multi-controller subsystem; ``nvme-cold.conf`` supplies the block-layer
+side.
+
+Run ``make run-nvmefault`` and the ``run-nvmeattach``, ``run-nvmedead``,
+``run-nvmedeadq``, ``run-nvmedmarev``, ``run-nvmehang``, ``run-nvmelate``,
+``run-nvmereplug``, ``run-nvmerdylie``, ``run-nvmestuck``, ``run-nvmewp``,
+``run-nvmeaer``, ``run-nvmenotready``, ``run-nvmeformatstall``,
+``run-nvmeformatreset`` and ``run-nvmeresv`` cases.
+
+.. note::
+   Every case ends in a recovery proof rather than an error report: the
+   driver has to reach a consistent state again.  A surprise unplug here
+   removes the device from the guest's view; the electrical and link
+   sequence, and power-loss atomics such as the ``CAP.CPS``/``FUAB`` race,
+   are not modelled.
+
+.. note::
+   The reset paths wipe the admin CQ (and the I/O rings) while the
+   controller is still disabled, and never take a completion for granted
+   by its phase bit alone: every admin command stamps a CID that never
+   repeats across a controller life, and a completion is only consumed
+   when the phase *and* the CID match.  A stale phase-1 entry left at the
+   head of an un-wiped ring can therefore not be returned as the status
+   of the next command, which is what the revive and format-reset paths
+   probe for with a planted entry before re-enabling the controller.
