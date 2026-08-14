@@ -525,3 +525,20 @@ resumes on the next notification, and a device reset re-arms the counter.
    that stops interrupting forever is a different failure with a different
    recovery.  First users are virtio-scsi (``run-scsiintr``) and
    virtio-net (``run-netmsidrop``).
+
+
+virtio-blk bring-up and ring exhaustion
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Run ``make run-vblktest`` for the clean path and
+``run-vblkbadtrack``, ``run-vblkerr``, ``run-vblkpersist`` for the
+``blkdebug`` profiles in ``vblk-*.conf``, plus ``run-vblkringfull`` for a
+ring that stops consuming.
+
+.. note::
+   Bring-up order (submission before the device is ready), a ring that
+   stops consuming, and an over-long descriptor chain are the three shapes
+   a block driver gets wrong without noticing.  ``blkdebug`` injects at
+   the block layer, so it cannot express a device that fails a request and
+   then *lies about why* on the retry; the persisting-error profile is the
+   closest available approximation.
