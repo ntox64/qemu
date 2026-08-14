@@ -277,6 +277,11 @@ const struct SCSISense sense_code_READ_ERROR = {
     .key = MEDIUM_ERROR, .asc = 0x11, .ascq = 0x00
 };
 
+/* Medium error, Write error */
+const struct SCSISense sense_code_WRITE_ERROR = {
+    .key = MEDIUM_ERROR, .asc = 0x0c, .ascq = 0x00
+};
+
 /* Not ready, Cause not reportable */
 const struct SCSISense sense_code_NOT_READY = {
     .key = NOT_READY, .asc = 0x04, .ascq = 0x00

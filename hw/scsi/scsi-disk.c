@@ -56,6 +56,7 @@
 #define DEFAULT_DISCARD_GRANULARITY (4 * KiB)
 #define DEFAULT_MAX_UNMAP_SIZE      (1 * GiB)
 #define DEFAULT_MAX_IO_SIZE         INT_MAX     /* 2 GB - 1 block */
+#define NTO64_DROP_SECTORS_MAX      8
 
 #define TYPE_SCSI_DISK_BASE         "scsi-disk-base"
 
@@ -111,6 +112,30 @@ struct SCSIDiskState {
     char *product;
     char *device_id;
     char *loadparm;     /* only for s390x */
+    /*
+     * "sector[:sector...]" - reads at these sectors never complete (each slot
+     * is one-shot on match)
+     */
+    char *nto64_drop_sectors_str;
+    uint64_t nto64_drop_sectors[NTO64_DROP_SECTORS_MAX];
+    uint32_t nto64_drop_count;
+    /* media-change / write-protect / bring-up shapes */
+    /*
+     * the first command at this sector triggers a one-shot capacity change (UA
+     * CAPACITY CHANGED + halved size)
+     */
+    uint64_t nto64_media_change_sector;
+    bool     nto64_media_changed;
+    /*
+     * the first command at this sector arms persistent write protection
+     */
+    uint64_t nto64_wp_trigger_sector;
+    bool     nto64_wp;
+    /*
+     * the first N TEST UNIT READY commands fail with NOT READY, then recover
+     */
+    uint32_t nto64_bringup_fail;
+    uint32_t nto64_bringup_fail_left;
     bool tray_open;
     bool tray_locked;
     /*
@@ -247,6 +272,17 @@ static bool scsi_handle_rw_error(SCSIDiskReq *r, int ret, bool acct_failed)
     if (ret < 0) {
         status = scsi_sense_from_errno(-ret, &sense);
         error = -ret;
+        /*
+         * A backend I/O error on an emulated disk is a media error:
+         * report the SPC-5 sense (MEDIUM ERROR, UNRECOVERED READ
+         * ERROR 03/11-00 for reads / WRITE ERROR 03/0c-00 for writes)
+         * instead of the generic ABORTED COMMAND that
+         * scsi_sense_from_errno maps EIO to.
+         */
+        if (error == EIO) {
+            sense = is_read ? SENSE_CODE(READ_ERROR)
+                            : SENSE_CODE(WRITE_ERROR);
+        }
     } else {
         /* A passthrough command has completed with nonzero status.  */
         status = ret;
@@ -411,6 +447,40 @@ static void scsi_dma_complete(void *opaque, int ret)
 
     assert(r->req.aiocb != NULL);
     r->req.aiocb = NULL;
+
+    /*
+     * one-shot dropped completion - the request never completes,
+     * so the guest must time it out and abort it via a TMF.  virtio-scsi
+     * reads use the SG path (scsi_dma_complete), not scsi_read_complete.
+     * The task-set TMF breadth (2026-08-22) arms several sectors via the
+     * colon-separated property (each slot is one-shot).
+     */
+    for (uint32_t i = 0; i < s->nto64_drop_count; i++) {
+        if (s->nto64_drop_sectors[i] &&
+            r->req.cmd.lba == s->nto64_drop_sectors[i]) {
+            s->nto64_drop_sectors[i] = 0;
+            return;
+        }
+    }
+
+    /*
+     * guest-visible media / write-protect changes
+     * are triggered by the command at the armed sector completing.
+     * The capacity change queues the CAPACITY CHANGED unit attention
+     * (SPC-5 06/2A-09) exactly like the block layer's resize_cb; the
+     * write-protect arm makes every later write fail 07/27.
+     */
+    if (s->nto64_media_change_sector &&
+        r->req.cmd.lba == s->nto64_media_change_sector &&
+        !s->nto64_media_changed) {
+        s->nto64_media_changed = true;
+        scsi_device_set_ua(&s->qdev, SENSE_CODE(CAPACITY_CHANGED));
+    }
+    if (s->nto64_wp_trigger_sector &&
+        r->req.cmd.lba == s->nto64_wp_trigger_sector &&
+        !s->nto64_wp) {
+        s->nto64_wp = true;
+    }
 
     /* ret > 0 is accounted for in scsi_disk_req_check_error() */
     if (ret < 0) {
@@ -2060,6 +2130,19 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
     memset(outbuf, 0, r->buflen);
     switch (req->cmd.buf[0]) {
     case TEST_UNIT_READY:
+        /*
+         * the armed bring-up failure - the first N
+         * TEST UNIT READY commands fail with NOT READY (02/04) while
+         * the logical unit initializes, then recover (SPC-5 5.1.2.5:
+         * TUR is the command to poll a logical unit until ready).
+         * Gated on the test driver's tag space (>= 0x1000) so
+         * SeaBIOS's pre-boot SCSI probe cannot consume the count.
+         */
+        if (s->nto64_bringup_fail_left && req->tag >= 0x1000) {
+            s->nto64_bringup_fail_left--;
+            scsi_check_condition(r, SENSE_CODE(NOT_READY));
+            return 0;
+        }
         assert(blk_is_available(s->qdev.conf.blk));
         break;
     case INQUIRY:
@@ -2122,6 +2205,15 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
             goto illegal_request;
         }
         nb_sectors /= s->qdev.blocksize / BDRV_SECTOR_SIZE;
+        /*
+         * after the armed media change, the
+         * capacity reports half its previous size - the driver must
+         * observe the UA, re-read the capacity and re-validate its
+         * I/O ranges.
+         */
+        if (s->nto64_media_changed) {
+            nb_sectors /= 2;
+        }
         /* Returned value is the address of the last sector.  */
         nb_sectors--;
         /* Remember the new size for read/write sanity checking. */
@@ -2334,6 +2426,15 @@ static int32_t scsi_disk_dma_command(SCSIRequest *req, uint8_t *buf)
     case WRITE_VERIFY_10:
     case WRITE_VERIFY_12:
     case WRITE_VERIFY_16:
+        /*
+         * the armed write-protect - every write
+         * fails with DATA PROTECT / WRITE PROTECTED (SPC-5 07/27-00)
+         * until the condition is cleared; reads stay available.
+         */
+        if (s->nto64_wp) {
+            scsi_check_condition(r, SENSE_CODE(WRITE_PROTECTED));
+            return 0;
+        }
         if (!blk_is_writable(s->qdev.conf.blk)) {
             scsi_check_condition(r, SENSE_CODE(WRITE_PROTECTED));
             return 0;
@@ -2497,6 +2598,9 @@ static void scsi_realize(SCSIDevice *dev, Error **errp)
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, dev);
     bool read_only;
 
+    /* arm the bring-up failure count for this run */
+    s->nto64_bringup_fail_left = s->nto64_bringup_fail;
+
     if (!s->qdev.conf.blk) {
         error_setg(errp, "drive property not set");
         return;
@@ -2593,9 +2697,46 @@ static void scsi_unrealize(SCSIDevice *dev)
     del_boot_device_lchs(&dev->qdev, NULL);
 }
 
+/*
+ * parse the nto64-drop-sector "sector[:sector...]" property into
+ * the one-shot drop slots.  Extra entries beyond the array size are
+ * truncated with a warning (the guest-facing shape only needs a handful).
+ */
+static void nto64_parse_drop_sectors(SCSIDiskState *s)
+{
+    const char *p = s->nto64_drop_sectors_str;
+
+    s->nto64_drop_count = 0;
+    if (!p || !*p) {
+        return;
+    }
+    while (*p && s->nto64_drop_count < NTO64_DROP_SECTORS_MAX) {
+        char *end;
+        unsigned long v = strtoul(p, &end, 0);
+
+        if (end == p) {
+            break;   /* empty or malformed token */
+        }
+        s->nto64_drop_sectors[s->nto64_drop_count++] = v;
+        if (*end == '\0') {
+            break;
+        }
+        if (*end != ':') {
+            break;   /* malformed separator */
+        }
+        p = end + 1;
+    }
+    if (*p && s->nto64_drop_count == NTO64_DROP_SECTORS_MAX) {
+        warn_report("nto64-drop-sector: more than %d sectors, "
+                    "ignoring the rest", NTO64_DROP_SECTORS_MAX);
+    }
+}
+
 static void scsi_hd_realize(SCSIDevice *dev, Error **errp)
 {
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, dev);
+
+    nto64_parse_drop_sectors(s);
 
     /* can happen for devices without drive. The error message for missing
      * backend will be issued in scsi_realize
@@ -3193,6 +3334,14 @@ static const Property scsi_hd_properties[] = {
                     SCSI_DISK_F_REMOVABLE, false),
     DEFINE_PROP_BIT("dpofua", SCSIDiskState, features,
                     SCSI_DISK_F_DPOFUA, true),
+    DEFINE_PROP_STRING("nto64-drop-sector", SCSIDiskState,
+                       nto64_drop_sectors_str),
+    DEFINE_PROP_UINT64("nto64-media-change-sector", SCSIDiskState,
+                       nto64_media_change_sector, 0),
+    DEFINE_PROP_UINT64("nto64-wp-trigger-sector", SCSIDiskState,
+                       nto64_wp_trigger_sector, 0),
+    DEFINE_PROP_UINT32("nto64-bringup-fail", SCSIDiskState,
+                       nto64_bringup_fail, 0),
     DEFINE_PROP_UINT64("wwn", SCSIDiskState, qdev.wwn, 0),
     DEFINE_PROP_UINT64("port_wwn", SCSIDiskState, qdev.port_wwn, 0),
     DEFINE_PROP_UINT16("port_index", SCSIDiskState, port_index, 0),

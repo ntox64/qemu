@@ -99,6 +99,8 @@ extern const struct SCSISense sense_code_LUN_COMM_FAILURE;
 extern const struct SCSISense sense_code_OVERLAPPED_COMMANDS;
 /* Medium error, Unrecovered read error */
 extern const struct SCSISense sense_code_READ_ERROR;
+/* Medium error, Write error */
+extern const struct SCSISense sense_code_WRITE_ERROR;
 /* LUN not ready, Cause not reportable */
 extern const struct SCSISense sense_code_NOT_READY;
 /* Unit attention, Capacity data has changed */

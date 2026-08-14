@@ -64,6 +64,94 @@ run-vblkringfull: vblktest vblk-clean.conf
 	    -device virtio-blk-pci,ioeventfd=off,drive=drive0,queue-size=8 \
 	    -kernel vblktest -append 'NTO64EXP=20' -serial stdio -display none -no-reboot
 
+scsitest: scsitest.S
+	# --build-id=none: see the numatest comment (multiboot span trap).
+	gcc -m32 -nostdlib -static -fno-pie \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext=0x101000 -Wl,--section-start=.multiboot=0x100000 \
+	    -o $@ $<
+
+SCSI_IMG = /tmp/scsi-test.img
+# Same graph requirement as: format on top of blkdebug, and
+# ioeventfd=off (the legacy notify ioeventfd swallows writes under TCG).
+SCSI_DRIVE = if=none,id=drv0,format=raw,werror=report,rerror=report,file=blkdebug:$(CURDIR)/$1:$(SCSI_IMG)
+SCSI_DEV = -device virtio-scsi-pci,ioeventfd=off,id=scsi0
+SCSI_HD = -device scsi-hd,drive=drv0,scsi-id=0,lun=0,bus=scsi0.0
+
+run-scsitest: scsitest scsi-clean.conf
+	truncate -s 4M $(SCSI_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call SCSI_DRIVE,scsi-clean.conf) \
+	    $(SCSI_DEV) $(SCSI_HD) \
+	    -kernel scsitest -append 'NTO64EXP=11121111121' -serial stdio -display none -no-reboot
+
+scsiintr: scsiintr.S
+	# --build-id=none: see the numatest comment (multiboot span trap).
+	gcc -m32 -nostdlib -static -fno-pie \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext=0x101000 -Wl,--section-start=.multiboot=0x100000 \
+	    -o $@ $<
+
+run-scsiintr: scsiintr scsi-clean.conf
+	truncate -s 4M $(SCSI_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call SCSI_DRIVE,scsi-clean.conf) \
+	    $(SCSI_DEV) $(SCSI_HD) \
+	    -kernel scsiintr -append 'NTO64EXP=0' \
+	    -serial stdio -display none -no-reboot
+
+run-scsiintrinj: scsiintr scsi-clean.conf
+	truncate -s 4M $(SCSI_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call SCSI_DRIVE,scsi-clean.conf) \
+	    -device virtio-scsi-pci,ioeventfd=off,id=scsi0,nto64-msix-drop=2 \
+	    $(SCSI_HD) \
+	    -kernel scsiintr -append 'NTO64EXP=1' \
+	    -serial stdio -display none -no-reboot
+
+run-scsifault: scsitest scsi-clean.conf
+	truncate -s 4M $(SCSI_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call SCSI_DRIVE,scsi-clean.conf) \
+	    $(SCSI_DEV) \
+	    -device scsi-hd,drive=drv0,scsi-id=0,lun=0,bus=scsi0.0,nto64-drop-sector=4000:4001:4002 \
+	    -kernel scsitest -append 'NTO64EXP=11221112221' -serial stdio -display none -no-reboot
+
+run-scsierr: scsitest scsi-err.conf
+	truncate -s 4M $(SCSI_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call SCSI_DRIVE,scsi-err.conf) \
+	    $(SCSI_DEV) $(SCSI_HD) \
+	    -kernel scsitest -append 'NTO64EXP=22121111121' -serial stdio -display none -no-reboot
+
+# media-change / write-protect / bring-up shapes.
+
+run-scsibringup: scsitest scsi-clean.conf
+	truncate -s 4M $(SCSI_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call SCSI_DRIVE,scsi-clean.conf) \
+	    $(SCSI_DEV) \
+	    -device scsi-hd,drive=drv0,scsi-id=0,lun=0,bus=scsi0.0,nto64-bringup-fail=3 \
+	    -kernel scsitest -append 'NTO64EXP=11122111121' -serial stdio -display none -no-reboot
+
+run-scsimedia: scsitest scsi-clean.conf
+	truncate -s 4M $(SCSI_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call SCSI_DRIVE,scsi-clean.conf) \
+	    $(SCSI_DEV) \
+	    -device scsi-hd,drive=drv0,scsi-id=0,lun=0,bus=scsi0.0,nto64-media-change-sector=100 \
+	    -kernel scsitest -append 'NTO64EXP=11121211121' -serial stdio -display none -no-reboot
+
+run-scsiwp: scsitest scsi-clean.conf
+	truncate -s 4M $(SCSI_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call SCSI_DRIVE,scsi-clean.conf) \
+	    $(SCSI_DEV) \
+	    -device scsi-hd,drive=drv0,scsi-id=0,lun=0,bus=scsi0.0,nto64-wp-trigger-sector=500 \
+	    -kernel scsitest -append 'NTO64EXP=11121121121' -serial stdio -display none -no-reboot
+
+# polling fallback (nto64-msix-drop on qemu-xhci) ----
+
 
 EXTRA_BUILT +=
-RUNTARGETS += run-vblkbadtrack run-vblkerr run-vblkpersist run-vblkringfull run-vblktest
+RUNTARGETS += run-scsibringup run-scsierr run-scsifault run-scsiintr run-scsiintrinj run-scsimedia run-scsitest run-scsiwp run-vblkbadtrack run-vblkerr run-vblkpersist run-vblkringfull run-vblktest

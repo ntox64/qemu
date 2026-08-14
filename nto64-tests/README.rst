@@ -542,3 +542,24 @@ ring that stops consuming.
    the block layer, so it cannot express a device that fails a request and
    then *lies about why* on the retry; the persisting-error profile is the
    closest available approximation.
+
+
+virtio-scsi and scsi-hd faults
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``scsi-hd`` gains ``nto64-drop-sector=a:b:c``, a colon-separated list of
+failing sectors (eight slots, with a warning when truncated), and the
+sense, media-change, capacity-change, write-protect and bring-up-readiness
+shapes are driven from the guest.
+
+Run ``make run-scsitest``, ``run-scsifault``, ``run-scsierr``,
+``run-scsibringup``, ``run-scsimedia``, ``run-scsiwp``, and
+``run-scsiintr``/``run-scsiintrinj`` for the lost completion.
+
+.. note::
+   The task-management coverage is where the wire format bites: abort task
+   set, clear task set, the ``I_T`` nexus reset and an abort racing a
+   command that is completing, with the subtypes a driver has to encode
+   correctly.  A unit that reports a failure once is easy; one that reports
+   it *differently* on retry, which is what breaks caching drivers, is
+   only partly covered.
