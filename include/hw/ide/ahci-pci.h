@@ -19,6 +19,8 @@ struct AHCIPCIState {
 
     AHCIState ahci;
     IRQState irq;
+    uint32_t nto64_msi_drop;        /* drop the Nth MSI raise */
+    uint32_t nto64_msi_drop_left;
 };
 
 #endif

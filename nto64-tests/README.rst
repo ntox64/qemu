@@ -563,3 +563,23 @@ Run ``make run-scsitest``, ``run-scsifault``, ``run-scsierr``,
    correctly.  A unit that reports a failure once is easy; one that reports
    it *differently* on retry, which is what breaks caching drivers, is
    only partly covered.
+
+
+SATA/AHCI bad track, retry and lost MSI
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The IDE/AHCI path gains bad-track, device retry, a wedged drive, slow
+media and NCQ error reporting, and ``ich9-ahci`` gains ``nto64-msi-drop``
+for its MSI (not MSI-X) completions.
+
+Run ``make run-satatest``, ``run-satabadtrack``, ``run-sataerr``,
+``run-satapersist``, ``run-sataslow``, ``run-satastuck``, ``run-satancq``,
+``run-satasdblie``, ``run-satad2hlie``, and ``run-ahciintr`` /
+``run-ahciintrdrop``.
+
+.. note::
+   AHCI completes through two channels - the SDB FIS carries an NCQ
+   command's status while the D2H FIS carries the device-ready and ``BSy``
+   state - and either can contradict the other, which is invisible to a
+   driver that trusts one.  The two ``*-lie`` cases exist for that.  No
+   cable or PHY behaviour beyond link state, and no port multiplier.

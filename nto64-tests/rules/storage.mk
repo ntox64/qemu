@@ -152,6 +152,128 @@ run-scsiwp: scsitest scsi-clean.conf
 
 # polling fallback (nto64-msix-drop on qemu-xhci) ----
 
+ahcitest: ahcitest.S
+	# --build-id=none: see the numatest comment (multiboot span trap).
+	gcc -m32 -nostdlib -static -fno-pie \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext=0x101000 -Wl,--section-start=.multiboot=0x100000 \
+	    -o $@ $<
+
+SATA_IMG = /tmp/sata-test.img
+# q35's built-in ICH9 AHCI; the drive attaches to its SATA bus (ide.0).
+# Same graph requirement as: format on top of blkdebug, and
+# werror=report/rerror=report so backend errors reach the drive instead
+# of stopping the VM.
+
+SATA_DRIVE = if=none,id=drive0,format=raw,werror=report,rerror=report,file=blkdebug:$(CURDIR)/$1:$(SATA_IMG)
+SATA_DEV = -device ide-hd,drive=drive0,bus=ide.0
+
+run-satatest: ahcitest sata-clean.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-clean.conf) \
+	    $(SATA_DEV) \
+	    -kernel ahcitest -append 'NTO64EXP=11111000000000' \
+	    -serial stdio -display none -no-reboot
+
+ahciintr: ahciintr.S
+	# --build-id=none: see the numatest comment (multiboot span trap).
+	gcc -m32 -nostdlib -static -fno-pie \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext=0x101000 -Wl,--section-start=.multiboot=0x100000 \
+	    -o $@ $<
+
+run-ahciintr: ahciintr sata-clean.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-clean.conf) \
+	    $(SATA_DEV) \
+	    -kernel ahciintr -append 'NTO64EXP=0' \
+	    -serial stdio -display none -no-reboot
+
+run-ahciintrdrop: ahciintr sata-clean.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -global ich9-ahci.nto64-msi-drop=2 \
+	    -drive $(call SATA_DRIVE,sata-clean.conf) \
+	    $(SATA_DEV) \
+	    -kernel ahciintr -append 'NTO64EXP=1' \
+	    -serial stdio -display none -no-reboot
+
+run-satabadtrack: ahcitest sata-badtrack.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-badtrack.conf) \
+	    $(SATA_DEV) \
+	    -kernel ahcitest -append 'NTO64EXP=21111000000000' \
+	    -serial stdio -display none -no-reboot
+
+run-sataerr: ahcitest sata-err.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-err.conf) \
+	    $(SATA_DEV) \
+	    -kernel ahcitest -append 'NTO64EXP=12221000000000' \
+	    -serial stdio -display none -no-reboot
+
+run-satapersist: ahcitest sata-persist.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-persist.conf) \
+	    $(SATA_DEV) \
+	    -kernel ahcitest -append 'NTO64EXP=11113100000000' \
+	    -serial stdio -display none -no-reboot
+
+run-sataslow: ahcitest sata-slow.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-slow.conf) \
+	    $(SATA_DEV) \
+	    -kernel ahcitest -append 'NTO64EXP=11111011000000' \
+	    -serial stdio -display none -no-reboot
+
+run-satastuck: ahcitest sata-clean.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-clean.conf) \
+	    -device ide-hd,drive=drive0,bus=ide.0,nto64-stuck-sector=7168 \
+	    -kernel ahcitest -append 'NTO64EXP=11111000110000' \
+	    -serial stdio -display none -no-reboot
+
+# NCQ + spec-breaking completion FISes.
+
+run-satancq: ahcitest sata-ncq.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-ncq.conf) \
+	    $(SATA_DEV) \
+	    -kernel ahcitest -append 'NTO64EXP=11111000000100' \
+	    -serial stdio -display none -no-reboot
+
+run-satasdblie: ahcitest sata-clean.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-clean.conf) \
+	    -device ide-hd,drive=drive0,bus=ide.0,nto64-sdb-lie-tag=0 \
+	    -kernel ahcitest -append 'NTO64EXP=11111000000010' \
+	    -serial stdio -display none -no-reboot
+
+run-satad2hlie: ahcitest sata-clean.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-clean.conf) \
+	    -device ide-hd,drive=drive0,bus=ide.0,nto64-d2h-lie-sector=0x1e10 \
+	    -kernel ahcitest -append 'NTO64EXP=11111000000003' \
+	    -serial stdio -display none -no-reboot
+
+run-satad2hlie2: ahcitest sata-d2hlie.conf
+	truncate -s 4M $(SATA_IMG)
+	$(QEMU) -machine q35 -m 64 \
+	    -drive $(call SATA_DRIVE,sata-d2hlie.conf) \
+	    -device ide-hd,drive=drive0,bus=ide.0,nto64-d2h-lie-sector=0x1e10 \
+	    -kernel ahcitest -append 'NTO64EXP=11111000000003' \
+	    -serial stdio -display none -no-reboot
+
 
 EXTRA_BUILT +=
-RUNTARGETS += run-scsibringup run-scsierr run-scsifault run-scsiintr run-scsiintrinj run-scsimedia run-scsitest run-scsiwp run-vblkbadtrack run-vblkerr run-vblkpersist run-vblkringfull run-vblktest
+RUNTARGETS += run-ahciintr run-ahciintrdrop run-satabadtrack run-satad2hlie run-satad2hlie2 run-sataerr run-satancq run-satapersist run-satasdblie run-sataslow run-satastuck run-satatest run-scsibringup run-scsierr run-scsifault run-scsiintr run-scsiintrinj run-scsimedia run-scsitest run-scsiwp run-vblkbadtrack run-vblkerr run-vblkpersist run-vblkringfull run-vblktest

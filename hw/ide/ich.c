@@ -93,9 +93,20 @@ static const VMStateDescription vmstate_ich9_ahci = {
 static void pci_ich9_ahci_update_irq(void *opaque, int irq_num, int level)
 {
     PCIDevice *pci_dev = opaque;
+    AHCIPCIState *d = ICH9_AHCI(pci_dev);
 
     if (msi_enabled(pci_dev)) {
         if (level) {
+            /*
+             * hook: the Nth deliverable MSI raise is dropped
+             * one-shot (the command/D2H still lands); a driver that
+             * bounds its ISR wait and falls back to polling recovers.
+             * Re-armed on device reset.
+             */
+            if (d->nto64_msi_drop_left > 0 &&
+                --d->nto64_msi_drop_left == 0) {
+                return;
+            }
             msi_notify(pci_dev, 0);
         }
     } else {
@@ -107,6 +118,8 @@ static void pci_ich9_reset(DeviceState *dev)
 {
     AHCIPCIState *d = ICH9_AHCI(dev);
 
+    /* hook: re-arm the one-shot MSI drop. */
+    d->nto64_msi_drop_left = d->nto64_msi_drop;
     ahci_reset(&d->ahci);
 }
 
@@ -176,6 +189,11 @@ static void pci_ich9_uninit(PCIDevice *dev)
     ahci_uninit(&d->ahci);
 }
 
+static const Property ich9_ahci_props[] = {
+    DEFINE_PROP_UINT32("nto64-msi-drop", AHCIPCIState,
+                       nto64_msi_drop, 0),
+};
+
 static void ich_ahci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -190,6 +208,7 @@ static void ich_ahci_class_init(ObjectClass *klass, const void *data)
     dc->vmsd = &vmstate_ich9_ahci;
     device_class_set_legacy_reset(dc, pci_ich9_reset);
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+    device_class_set_props(dc, ich9_ahci_props);
 }
 
 static const TypeInfo ich_ahci_info = {

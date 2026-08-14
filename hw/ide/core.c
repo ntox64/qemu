@@ -536,7 +536,9 @@ BlockAIOCB *ide_issue_trim(
 void ide_abort_command(IDEState *s)
 {
     s->status = READY_STAT | ERR_STAT;
-    s->error = ABRT_ERR;
+    if (!s->error) {
+        s->error = ABRT_ERR;
+    }
     ide_transfer_stop(s);
 }
 
@@ -856,10 +858,17 @@ int ide_handle_rw_error(IDEState *s, int error, int op)
     } else if (action == BLOCK_ERROR_ACTION_REPORT) {
         block_acct_failed(blk_get_stats(s->blk), &s->acct);
         if (IS_IDE_RETRY_DMA(op)) {
+            /*
+             * ATA-6 READ/WRITE DMA EXT: UNC is set if data is
+             * uncorrectable - a backend media error is reported with
+             * UNC (0x40), not the generic ABRT.
+             */
+            s->error = ECC_ERR;
             ide_dma_error(s);
         } else if (IS_IDE_RETRY_ATAPI(op)) {
             ide_atapi_io_error(s, -error);
         } else {
+            s->error = ECC_ERR;
             ide_rw_error(s);
         }
     }
@@ -949,6 +958,20 @@ static void ide_dma_cb(void *opaque, int ret)
     }
 
     offset = sector_num << BDRV_SECTOR_BITS;
+    if (!s->nto64_stuck && s->nto64_stuck_sector != UINT64_MAX &&
+        s->dma_cmd == IDE_DMA_READ &&
+        sector_num <= s->nto64_stuck_sector &&
+        s->nto64_stuck_sector < sector_num + n) {
+        /*
+         * nto64 testbed: the drive wedges while recovering
+         * the media error at this sector - BSY is held, the command
+         * never completes, later commands are refused (handle_cmd's
+         * busy check), and only a port reset (COMRESET) clears it.
+         */
+        s->nto64_stuck = true;
+        s->status = BUSY_STAT;
+        return;
+    }
     switch (s->dma_cmd) {
     case IDE_DMA_READ:
         s->bus->dma->aiocb = dma_blk_read(s->blk, &s->sg, offset,

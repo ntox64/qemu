@@ -58,6 +58,25 @@ struct IDEState {
     IDEDriveKind drive_kind;
     int drive_heads, drive_sectors;
     int cylinders, heads, sectors, chs_trans;
+    /*
+     * nto64 testbed: media-recovery wedge - a command at
+     * nto64_stuck_sector holds BSY forever (never completes); only a
+     * port reset (COMRESET) clears it.
+     */
+    uint64_t nto64_stuck_sector;
+    bool nto64_stuck;
+    /*
+     * spec-breaking completion FISes - one-shot per
+     * arm.  nto64_d2h_lie_sector: the D2H for a command at this sector
+     * reports the OPPOSITE of the truth (clean for an errored command,
+     * ERR for a successful one).  nto64_sdb_lie_tag: the SDB for this
+     * NCQ tag clears the WRONG SAct bit.
+     */
+    uint64_t nto64_d2h_lie_sector;
+    bool nto64_d2h_lie_done;
+    uint32_t nto64_sdb_lie_tag;
+    bool nto64_sdb_lie_done;
+    uint64_t nto64_cmd_lba;  /* the start LBA of the in-flight command */
     int64_t nb_sectors;
     int mult_sectors;
     int identify_set;
@@ -165,6 +184,9 @@ struct IDEDevice {
      */
     uint16_t rotation_rate;
     bool win2k_install_hack;
+    uint64_t nto64_stuck_sector;
+    uint64_t nto64_d2h_lie_sector;
+    uint32_t nto64_sdb_lie_tag;
 };
 
 typedef struct IDEDrive {
@@ -177,7 +199,13 @@ typedef struct IDEDrive {
     DEFINE_PROP_STRING("ver",  IDEDrive, dev.version),  \
     DEFINE_PROP_UINT64("wwn",  IDEDrive, dev.wwn, 0),   \
     DEFINE_PROP_STRING("serial",  IDEDrive, dev.serial),\
-    DEFINE_PROP_STRING("model", IDEDrive, dev.model)
+    DEFINE_PROP_STRING("model", IDEDrive, dev.model),   \
+    DEFINE_PROP_UINT64("nto64-stuck-sector", IDEDrive,  \
+                       dev.nto64_stuck_sector, UINT64_MAX),  \
+    DEFINE_PROP_UINT64("nto64-d2h-lie-sector", IDEDrive,  \
+                       dev.nto64_d2h_lie_sector, UINT64_MAX),  \
+    DEFINE_PROP_UINT32("nto64-sdb-lie-tag", IDEDrive,  \
+                       dev.nto64_sdb_lie_tag, UINT32_MAX)
 
 void ide_dev_initfn(IDEDevice *dev, IDEDriveKind kind, Error **errp);
 

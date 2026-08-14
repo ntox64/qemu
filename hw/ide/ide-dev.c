@@ -78,6 +78,10 @@ void ide_dev_initfn(IDEDevice *dev, IDEDriveKind kind, Error **errp)
     IDEState *s = bus->ifs + dev->unit;
     int ret;
 
+    s->nto64_stuck_sector = dev->nto64_stuck_sector;
+    s->nto64_d2h_lie_sector = dev->nto64_d2h_lie_sector;
+    s->nto64_sdb_lie_tag = dev->nto64_sdb_lie_tag;
+
     if (!dev->conf.blk) {
         if (kind != IDE_CD) {
             error_setg(errp, "No drive specified");

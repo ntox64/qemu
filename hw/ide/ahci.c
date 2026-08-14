@@ -756,6 +756,7 @@ static void ahci_write_fis_sdb(AHCIState *s, NCQTransferState *ncq_tfs)
     AHCIPortRegs *pr = &ad->port_regs;
     IDEState *ide_state;
     SDBFIS *sdb_fis;
+    bool sdb_lie = false;
 
     if (!ad->res_fis ||
         !(pr->cmd & PORT_CMD_FIS_RX)) {
@@ -773,11 +774,35 @@ static void ahci_write_fis_sdb(AHCIState *s, NCQTransferState *ncq_tfs)
     /* update SAct field in SDB_FIS */
     sdb_fis->payload = cpu_to_le32(ad->finished);
 
+    if (!ide_state->nto64_sdb_lie_done &&
+        ide_state->nto64_sdb_lie_tag != UINT32_MAX &&
+        ncq_tfs->tag == ide_state->nto64_sdb_lie_tag) {
+        /*
+         * nto64 testbed: the SDB for this NCQ
+         * completion LIES about the SAct payload - it clears the WRONG
+         * tag, so the host's PxSACT tracking desyncs and the finished
+         * tag looks stuck.  The driver must bound-wait and recover.
+         * One-shot.
+         */
+        ide_state->nto64_sdb_lie_done = true;
+        ide_state->nto64_sdb_lie_tag = 0;
+        sdb_lie = true;
+        sdb_fis->payload =
+            cpu_to_le32(1 << ((ncq_tfs->tag + 1) & 31));
+    }
+
     /* Update shadow registers (except BSY 0x80 and DRQ 0x08) */
     pr->tfdata = (ad->port.ifs[0].error << 8) |
         (ad->port.ifs[0].status & 0x77) |
         (pr->tfdata & 0x88);
     pr->scr_act &= ~ad->finished;
+    if (sdb_lie) {
+        /*
+         * the lied SDB left the finished tag looking stuck: keep the
+         * bit set so the host's bounded PxSACT wait really times out
+         */
+        pr->scr_act |= (1 << ncq_tfs->tag);
+    }
     ad->finished = 0;
 
     /*
@@ -847,6 +872,28 @@ static bool ahci_write_fis_d2h(AHCIDevice *ad, bool d2h_fis_i)
     }
 
     d2h_fis = &ad->res_fis[RES_FIS_RFIS];
+
+    if (!s->nto64_d2h_lie_done &&
+        s->nto64_d2h_lie_sector != UINT64_MAX &&
+        s->dma_cmd == IDE_DMA_READ &&
+        s->nto64_cmd_lba == s->nto64_d2h_lie_sector) {
+        /*
+         * nto64 testbed: the D2H for this command
+         * LIES - it reports the OPPOSITE of the truth.  A successful
+         * command reports ERR (the driver must recover from a false
+         * error without corrupting anything) and an errored command
+         * reports clean status (the driver must verify the DATA, not
+         * trust a clean completion).  One-shot.
+         */
+        s->nto64_d2h_lie_done = true;
+        if (s->status & ERR_STAT) {
+            s->status &= ~ERR_STAT;
+            s->error = 0;
+        } else {
+            s->status |= ERR_STAT;
+            s->error = ECC_ERR;
+        }
+    }
 
     d2h_fis[0] = SATA_FIS_TYPE_REGISTER_D2H;
     d2h_fis[1] = d2h_fis_i ? (1 << 6) : 0; /* interrupt bit */
@@ -1013,6 +1060,7 @@ static void ncq_finish(NCQTransferState *ncq_tfs)
 static void ncq_cb(void *opaque, int ret)
 {
     NCQTransferState *ncq_tfs = (NCQTransferState *)opaque;
+
     IDEState *ide_state = &ncq_tfs->drive->port.ifs[0];
 
     ncq_tfs->aiocb = NULL;
@@ -1275,6 +1323,10 @@ static void handle_reg_h2d_fis(AHCIState *s, int port,
     ide_state->hob_hcyl = cmd_fis[10];   /* LBA 47:40 */
     ide_state->hob_feature = cmd_fis[11];
     ide_state->nsector = (int64_t)((cmd_fis[13] << 8) | cmd_fis[12]);
+    ide_state->nto64_cmd_lba =
+        ((uint64_t)ide_state->hcyl << 16 |
+         (uint64_t)ide_state->lcyl << 8 |
+         ide_state->sector);
     /* 14, 16, 17, 18, 19: Reserved (SATA 1.0) */
     /* 15: Only valid when UPDATE_COMMAND not set. */
 
@@ -1550,6 +1602,7 @@ static void ahci_cmd_done(const IDEDMA *dma)
     ahci_write_fis_d2h(ad, true);
 
     if (!(ide_state->status & ERR_STAT) &&
+        !ide_state->nto64_d2h_lie_done &&
         ad->port_regs.cmd_issue && !ad->check_bh) {
         ad->check_bh = qemu_bh_new_guarded(ahci_check_cmd_bh, ad,
                                            &ad->mem_reentrancy_guard);
