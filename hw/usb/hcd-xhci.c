@@ -592,6 +592,20 @@ static void xhci_intr_raise(XHCIState *xhci, int v)
     if (!(xhci->usbcmd & USBCMD_INTE)) {
         return;
     }
+    if (xhci->nto64_msix_drop_left > 0) {
+        if (--xhci->nto64_msix_drop_left == 0) {
+            /*
+             * the armed interrupt is lost.  The event is
+             * already in the event ring and IMAN_IP / ERDP_EHB stay
+             * set, but no INTx / MSI(-X) is raised - the guest times
+             * out and recovers by polling the event ring.  One-shot:
+             * delivery resumes on the next raise.
+             */
+            DPRINTF("xhci: nto64-msix-drop: interrupt %d suppressed\n",
+                    v);
+            return;
+        }
+    }
     if (xhci->intr_raise) {
         if (xhci->intr_raise(xhci, v, true)) {
             xhci->intr[v].iman &= ~IMAN_IP;
@@ -2708,6 +2722,7 @@ static void xhci_reset(DeviceState *dev)
     xhci->dcbaap_low = 0;
     xhci->dcbaap_high = 0;
     xhci->config = 0;
+    xhci->nto64_msix_drop_left = xhci->nto64_msix_drop;
 
     for (i = 0; i < xhci->numslots; i++) {
         xhci_disable_slot(xhci, i+1);
@@ -3637,6 +3652,8 @@ static const Property xhci_properties[] = {
     DEFINE_PROP_UINT32("p3",    XHCIState, numports_3, 4),
     DEFINE_PROP_LINK("host",    XHCIState, hostOpaque, TYPE_DEVICE,
                      DeviceState *),
+    DEFINE_PROP_UINT32("nto64-msix-drop", XHCIState,
+                       nto64_msix_drop, 0),
 };
 
 static void xhci_class_init(ObjectClass *klass, const void *data)

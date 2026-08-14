@@ -649,3 +649,19 @@ fallback and resume cycle on a controller that keeps completing commands.
    The storage-side instance of the transport case above.  A controller
    that stops posting completions at all is the dead-queue case, which is
    a different test with a different recovery.
+
+
+USB
+---
+
+xHCI interrupt loss
+~~~~~~~~~~~~~~~~~~
+
+``qemu-xhci`` can drop the interrupt for one transfer while still writing
+the completion into the event ring.  Run ``make run-usbintr`` and
+``run-usbintrdrop``.
+
+.. note::
+   A USB completion is ring state *plus* an interrupt, and losing the
+   second is invisible from the first, so the case is verified by data and
+   by the device-side counters rather than by counting deliveries.

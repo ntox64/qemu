@@ -223,6 +223,16 @@ typedef struct XHCIState {
     XHCIRing cmd_ring;
 
     bool nec_quirks;
+    /*
+     * interrupt-loss fault - when armed, the Nth deliverable
+     * interrupt raise is suppressed (one-shot).  The completion event
+     * is still written to the event ring and the pending bits
+     * (IMAN_IP / ERDP_EHB) stay set, so a driver that falls back to
+     * polling finds the completion; delivery resumes on the next
+     * raise.
+     */
+    uint32_t nto64_msix_drop;
+    uint32_t nto64_msix_drop_left;
 } XHCIState;
 
 extern const VMStateDescription vmstate_xhci;
