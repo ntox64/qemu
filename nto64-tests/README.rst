@@ -720,3 +720,20 @@ Run ``make run-usboc``, ``run-usbocpersist``, ``run-usboclevel``,
    or trusts a cached value.  Power itself is a model: a port that
    over-currents does not actually interrupt power delivery to a
    co-scheduled device beyond what the hub's state machine reports.
+
+
+Mid-transfer disconnect and port churn
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nto64-disconnect`` removes a device while a transfer is in flight
+(optionally re-plugging it after ``nto64-replug-ms``), and a hub with
+``nto64-port-storm`` flaps a port on a timer.  Run
+``make run-usbeject``, ``run-usbejectinflight``, ``run-usbdisconnect`` and
+``run-usbstorm``.
+
+.. note::
+   These are the two ways a USB stack loses state it did not know it held.
+   What is checked is that it notices, quiesces and re-enumerates without
+   wedging a controller that is still healthy.  A disconnect is a
+   device-side event: there is no VBUS or connector timing, and the hub
+   keeps its own port state rather than emulating an electrical bounce.

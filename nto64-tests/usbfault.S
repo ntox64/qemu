@@ -1658,6 +1658,7 @@ run_phases:
     jne 1f
     call phase_a7
     call phase_a8
+    call phase_a9
     call phase_a11
 1:
     ret
@@ -1880,6 +1881,7 @@ phase_a7:
     ret
 9:  movl $1, fail
     ret
+
 /* phase_a8: WRITE-PROTECT (usb-storage nto64-write-protect=on).  The
  * guest arms the hook, then a WRITE must fail CLEANLY with the
  * WRITE-PROTECTED sense - no silent success, no image corruption. */
@@ -1928,7 +1930,62 @@ phase_a8:
 9:  movl $1, fail
     ret
 
-
+/* phase_a9: FLUSH-LIE + POWER-LOSS (usb-storage nto64-flush-lie=on).
+ * The guest arms the hook and the replug, writes a pattern, runs
+ * SYNCHRONIZE CACHE (reports success) and then "power-loss": the
+ * device detaches mid-transfer and re-attaches.  After the replug the
+ * write is GONE - the driver re-enumerates and the read returns the
+ * pre-write pattern, proving the flush lied. */
+phase_a9:
+    movl $1, a9
+    /* prefill BEFORE arming, like a7 */
+    call pattern_fill
+    movl $7000, %ebx
+    call transport_write
+    cmpl $0, %eax
+    jne 9f
+    /* arm flush-lie (0x57) + the replug (0x56) */
+    movl $setup_arm57, %ebx
+    call arm_vendor
+    call get_hook_status
+    testl %eax, %eax
+    jnz 9f
+    movl hook_status, %eax
+    andl $4, %eax
+    testl %eax, %eax
+    jz 8f                    /* hook absent: plain write+sync, done */
+1:  call pattern_fill
+    movl $7000, %ebx
+    call transport_write
+    testl %eax, %eax
+    jnz 9f
+    call transport_sync
+    testl %eax, %eax
+    jnz 9f
+    movl $setup_arm56, %ebx
+    call arm_vendor
+    call get_hook_status
+    testl %eax, %eax
+    jnz 9f
+    movl hook_status, %eax
+    andl $8, %eax
+    testl %eax, %eax
+    jz 8f                    /* replug hook absent: clean target */
+2:  movl $2, a9
+    /* the SYNCHRONIZE CACHE lied: the write never reached the
+     * backend, so a re-read through the SAME connection returns the
+     * pre-write pattern (power-loss equivalent: the data is gone) */
+    movl $7000, %ebx
+    call transport_read
+    testl %eax, %eax
+    jnz 9f
+    call verify_pattern
+    testl %eax, %eax
+    jnz 9f
+    ret
+8:  ret
+9:  movl $1, fail
+    ret
 
 /* ================================================================== */
 /* eject DURING an in-flight transfer             */
@@ -2006,11 +2063,11 @@ reset_port:
  * nto64-eject-inflight-lba, guest-armed via vendor 0x5a).  The READ
  * at the armed LBA starts (CBW accepted, data phase held ASYNC) and
  * the device detaches mid-transfer, so the transfer dies with no
- * completion.  The driver bounds its read wait, settles past the
- * deterministic replug, resets the port and full-resets the
- * controller (HCRST clears the command/event-ring state, slots and
- * endpoints), then re-enumerates and re-reads: the pattern survives
- * because the backend was never touched. */
+ * completion.  The driver bounds its read wait, notices the port
+ * disconnect, tears the slot down, waits for the replug, resets the
+ * port and re-enumerates (fresh rings + slot + descriptors), then
+ * re-reads and verifies the pattern (the backend was never touched -
+ * the prefill survives the lost transfer). */
 phase_a11:
     movl $1, a11
     call pattern_fill
@@ -2456,10 +2513,6 @@ rw_retry_read:
 
 /* pattern fill helpers */
 pattern_write:
-    movl $sp_a8, %esi
-    call puts
-    movl a8, %eax
-    call puthex
     call pattern_fill
     xorl %ebx, %ebx
     call transport_write
@@ -2524,7 +2577,6 @@ verify_pattern:
 /* ================================================================== */
 /* helpers                                                           */
 /* ================================================================== */
-a8:         .long 0
 op_read:
     addl op_base, %eax
     movl (%eax), %eax
@@ -2610,7 +2662,6 @@ putc:
     pushl %eax
 1:  movl $0x3fd, %edx
     inb %dx, %al
-setup_arm58: .byte 0x40,0x58,0x00,0x00,0x00,0x00,0x00,0x00
     testb $0x20, %al
     jz 1b
     movl $0x3f8, %edx
@@ -2641,7 +2692,6 @@ report:
     call puts
     movl a2, %eax
     call puthex
-sp_a8:      .asciz " a8="
     movl $sp_a3, %esi
     call puts
     movl a3, %eax
@@ -2662,9 +2712,21 @@ sp_a8:      .asciz " a8="
     call puts
     movl a7, %eax
     call puthex
+    movl $sp_a8, %esi
+    call puts
+    movl a8, %eax
+    call puthex
+    movl $sp_a9, %esi
+    call puts
+    movl a9, %eax
+    call puthex
     movl $sp_a10, %esi
     call puts
     movl a10, %eax
+    call puthex
+    movl $sp_a11, %esi
+    call puts
+    movl a11, %eax
     call puthex
     movl $msg_evg, %esi
     call puts
@@ -2730,6 +2792,8 @@ a4:         .long 0
 a5:         .long 0
 a6:         .long 0
 a7:         .long 0
+a8:         .long 0
+a9:         .long 0
 a10:        .long 0
 a11:        .long 0
 isoc_idx:   .long 0
@@ -2816,7 +2880,9 @@ setup_sc:   .byte 0x00,0x09,0x01,0x00,0x00,0x00,0x00,0x00
 setup_cfh:  .byte 0x02,0x01,0x00,0x00,0x00,0x00,0x00,0x00
 setup_bmsr: .byte 0x21,0xff,0x00,0x00,0x00,0x00,0x00,0x00
 /*  vendor arms (guest-only, no data stage) */
+setup_arm56: .byte 0x40,0x56,0x00,0x00,0x00,0x00,0x00,0x00
 setup_arm57: .byte 0x40,0x57,0x00,0x00,0x00,0x00,0x00,0x00
+setup_arm58: .byte 0x40,0x58,0x00,0x00,0x00,0x00,0x00,0x00
 setup_arm5a: .byte 0x40,0x5a,0x00,0x00,0x00,0x00,0x00,0x00
 /* vendor READ of the armed-hook status */
 setup_getstatus: .byte 0xc0,0x59,0x00,0x00,0x00,0x00,0x01,0x00
@@ -2848,6 +2914,8 @@ sp_a4:      .asciz " a4="
 sp_a5:      .asciz " a5="
 sp_a6:      .asciz " a6="
 sp_a7:      .asciz " a7="
+sp_a8:      .asciz " a8="
+sp_a9:      .asciz " a9="
 sp_a10:     .asciz " a10="
 sp_a11:     .asciz " a11="
 sp_f:       .asciz " f="

@@ -15,6 +15,7 @@
 #include "hw/usb/msd.h"
 #include "system/system.h"
 #include "system/block-backend.h"
+#include "qemu/timer.h"
 
 static const struct SCSIBusInfo usb_msd_scsi_info_storage = {
     .tcq = false,
@@ -65,6 +66,18 @@ static void usb_msd_storage_realize(USBDevice *dev, Error **errp)
     }
     usb_msd_handle_reset(dev);
     s->scsi_dev = scsi_dev;
+    s->disconnect_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       usb_msd_disconnect_cb, s);
+    s->replug_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   usb_msd_replug_cb, s);
+}
+
+static void usb_msd_storage_unrealize(USBDevice *dev)
+{
+    MSDState *s = USB_STORAGE_DEV(dev);
+
+    timer_free(s->disconnect_timer);
+    timer_free(s->replug_timer);
 }
 
 static const Property msd_properties[] = {
@@ -78,6 +91,8 @@ static const Property msd_properties[] = {
     DEFINE_PROP_UINT64("nto64-eject-inflight-lba", MSDState,
                        nto64_eject_inflight_lba, 0),
     DEFINE_PROP_BOOL("nto64-write-protect", MSDState, nto64_wp, false),
+    DEFINE_PROP_BOOL("nto64-flush-lie", MSDState, nto64_flush_lie, false),
+    DEFINE_PROP_UINT32("nto64-replug-ms", MSDState, nto64_replug_ms, 2000),
 };
 
 static void usb_msd_class_storage_initfn(ObjectClass *klass, const void *data)
@@ -86,6 +101,7 @@ static void usb_msd_class_storage_initfn(ObjectClass *klass, const void *data)
     USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
 
     uc->realize = usb_msd_storage_realize;
+    uc->unrealize = usb_msd_storage_unrealize;
     device_class_set_props(dc, msd_properties);
 }
 

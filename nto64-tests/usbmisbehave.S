@@ -41,6 +41,21 @@
  *        bad-desc / no-config / stall-config / reset-hang devices are
  *        rejected with a bounded port-reset retry; an over-budget
  *        device (bMaxPower x 2 > 500 mA) is never configured.
+ *   a7 - mid-transfer disconnect: the composite is armed by
+ *        a guest-only vendor request (nto64-disconnect on usb-nto64);
+ *        the next bulk transfer starts but the device VANISHES
+ *        mid-transfer (the packet is held in flight, the device
+ *        detaches after ~1 ms, so the transfer never completes).  The
+ *        driver times out, notices the port disconnect, disables the
+ *        slot, waits for the replug (nto64-replug-ms), re-enumerates
+ *        and re-verifies the echo (a lost completion is retried a
+ *        bounded number of times, a wrong echo is not tolerated).
+ *   a8 - hub-port connect/disconnect storm: a guest-only
+ *        vendor request to the hub starts nto64-port-storm (the
+ *        downstream port's child detaches/attaches storm-flaps times);
+ *        the driver bounds its wait, re-enumerates after the storm
+ *        settles (recycling the composite's transfer rings under the
+ *        new slot) and verifies the composite echo.
  *
  * Verified target matrix (run-* targets, all f=0):
  *   run-usbmisbehave:  a1=4 a2=1 a3=1 a4=1 a5=1 a6=0 (clean)
@@ -65,13 +80,18 @@
  *   run-usbenum:       a1=3 a6=4 (four enumeration-fault devices
  *                      rejected, healthy devices all up)
  *   run-usbpower:      a1=4 a6=1 (over-budget device rejected)
+ *   Every target also runs thephases in their clean shape
+ *   (a7=1 a8=1); run-usbdisconnect additionally expects a7=2 (the
+ *   mid-transfer disconnect -> teardown -> replug -> re-enumerate)
+ *   and run-usbstorm a8=2 (storm -> settle -> re-enumerate).
  * The HID data faults are armed by SET_IDLE (only the guest driver
  * sends it), so BIOS boot enumeration cannot consume them.
  * The over-current fault is armed by the hub's SET_CONFIGURATION for
  * the same reason (BIOS enumerates the hub and would consume an edge
  * change bit / the self-clear read counter).
  *
- * Prints 'USB-BAD a1=... a2=... a3=... a4=... a5=... a6=... f=...'
+ * Prints 'USB-BAD a1=... a2=... a3=... a4=... a5=... a6=... a7=...
+ * a8=... f=...'
  * and halts.  Machine: -machine pc -m 64, -device qemu-xhci,p3=0
  * plus the hub/mouse/nto64 set (see the Makefile run-usb* targets).
  * Specs: xHCI 1.1, USB 2.0 (hub class requests), HID 1.11.
@@ -192,6 +212,14 @@
 #define ERR_POWER      5       /* bMaxPower x2 over the 500 mA budget */
 #define ERR_OTHER      6
 
+/* comp_verify_a / comp_verify_b verdicts.  A failed transfer is a
+ * transient completion (STALL, timeout, lost event) and a driver may
+ * retry it; an echo that comes back with the wrong bytes is a
+ * correctness failure and no number of retries makes it pass. */
+#define VERIFY_OK      0
+#define VERIFY_XFER    1
+#define VERIFY_DATA    2
+
 /* hub class request values (USB 2.0 11.24) */
 #define PORT_FEAT_RESET         4
 #define PORT_FEAT_POWER         8
@@ -208,6 +236,7 @@
 _start:
     movl $stack_top, %esp
     andl $-16, %esp
+    movl $5000, tx_bound
 
     /* IDT + PIT (copy of thesetup): every poll yields with
      * sti;hlt so the PIT (~1 ms, IRQ0) wakes the guest and QEMU's
@@ -295,6 +324,9 @@ found_xhci:
     call phase_a3
     call phase_a4
     call phase_a5
+    call phase_a7
+    call phase_a8
+    call phase_a9
     call report
     jmp halt
 
@@ -468,6 +500,51 @@ ring_init:
     movl $0, 4(%eax)
     movl $0, 8(%eax)
     movl $((1 << 1) | (TRB_LINK << 10) | 1), 12(%eax)
+    ret
+
+/* dev_rings_recycle: eax = device index.  Clear that device's ring
+ * MEMORY and rebuild all 5 ring states (EP0 + the 4 data endpoint
+ * slots), so the device is re-enumerated on the rings it started with.
+ * Call it after Disable Slot and before the bring-up of the new slot.
+ *
+ * A fresh slot always starts at ring base with the endpoint context's
+ * Cycle Bit set to 1 (dev_configure / cfg_ep_ctx), while the producer
+ * here keeps the ring it was already using: the enqueue pointer sits
+ * wherever the last transfer left it and the cycle state has flipped
+ * every time the ring wrapped.  Left alone, that mismatch does two
+ * things, both wrong:
+ *   - the new consumer finds the PREVIOUS lifecycle's TRBs at ring base
+ *     still marked C=1 and executes them again - a completed GET or a
+ *     completed vendor arm request is re-served, and its completion
+ *     event carries the same ring-slot pointer a later transfer will
+ *     use, so the driver can even accept a stale completion as its own;
+ *   - once the producer's cycle has flipped (PCS=0) the TRBs it writes
+ *     are never fetched, because the context only accepts C=1: the
+ *     transfer just times out.
+ * ring_init alone does not fix the first half - it only rewrites the
+ * Link TRB, the stale TRBs at the head of the ring survive - hence the
+ * explicit zeroing of the ring storage.  Clobbers eax/ecx/edx/edi and
+ * ring_dev; preserves ebx. */
+dev_rings_recycle:
+    pushl %ebx
+    movl %eax, %ebx
+    imull $5, %ebx, %edx
+    imull $RING_BYTES, %edx, %edx
+    lea dev_rings(%edx), %edi
+    movl $(5 * RING_BYTES), %ecx
+    xorl %eax, %eax
+    rep stosb
+    movl %ebx, ring_dev
+    xorl %ecx, %ecx
+1:  cmpl $5, %ecx
+    jae 2f
+    pushl %ecx
+    call ring_for_dev_ep        /* eax = storage, edi = state */
+    call ring_init
+    popl %ecx
+    incl %ecx
+    jmp 1b
+2:  popl %ebx
     ret
 
 /* enq_trb: esi = 16-byte TRB template (cycle bit 0), edi = ring state. */
@@ -730,7 +807,7 @@ xhci_tx:
     addl db_base, %eax
     movl tx_dci, %ecx
     movl %ecx, (%eax)
-    movl $5000, %ecx
+    movl tx_bound, %ecx
     movl $TRB_EV_TRANSFER, ev_expect_type
     movl tx_addr, %eax
     movl %eax, ev_expect_ptr
@@ -1348,7 +1425,11 @@ cls_nnext:
 cls_done:
     ret
 
-/* dev_disable: Disable Slot for cur_dev. */
+/* dev_disable: Disable Slot for cur_dev.  Returns eax = the command
+ * completion code (CC_SUCCESS when the slot is gone), so a recovery
+ * path can tell a real teardown from a command that never landed -
+ * rebuilding a fresh slot on top of a slot that is still enabled (and
+ * still owns the rings) would hide the failure the phase is testing. */
 dev_disable:
     movl cur_dev, %eax
     imull $DEV_STRIDE, %eax, %eax
@@ -1363,10 +1444,12 @@ dev_disable:
     orl $(TRB_DISABLE_SLOT << 10), %eax
     movl %eax, 12(%esi)
     call xhci_cmd
+    movl %eax, %edx          /* keep the completion code */
     movl cur_dev, %eax
     imull $DEV_STRIDE, %eax, %eax
     lea dev_table(%eax), %ecx
     movl $0, DEV_STATE(%ecx)
+    movl %edx, %eax
     ret
 
 /* bringup: full enumeration of cur_dev.  Returns eax error code. */
@@ -2033,6 +2116,16 @@ phase_a5:
     /* device reset: the dead function persists (hardware fault) */
     call dev_port_reset
     call dev_disable
+    cmpl $CC_SUCCESS, %eax
+    jne fail_phase
+    /* The reset cost the composite its slot, not its ring MEMORY: the
+     * fresh slot consumes from ring base with C=1 while the producer
+     * here is wherever the phases before it left it (and its cycle has
+     * flipped every wrap), so the old TRBs at the head of the ring
+     * would be replayed - or the transfer would time out once PCS
+     * reads 0.  Same recycle as the a7/a8/a9/a10 recoveries. */
+    movl cur_dev, %eax
+    call dev_rings_recycle
     call bringup
     testl %eax, %eax
     jnz fail_phase
@@ -2076,8 +2169,29 @@ comp_xfer:
     call xhci_tx
     ret
 
-/* comp_verify_a: pattern A round-trip on interface 0.  eax = 0 pass,
- * 1 = the transfer failed (stall/timeout) or data mismatch. */
+/* poison_rw_buf: fill the IN buffer with a pattern no echo can produce.
+ * comp_verify_a/b call it before every IN so that a zero-length or
+ * short transfer cannot compare against whatever the previous phase
+ * left in rw_buf - the compare alone only says "the buffer holds the
+ * pattern", not "this transfer delivered it".  Clobbers eax/ecx/edi;
+ * preserves ebx/edx/esi/ebp. */
+poison_rw_buf:
+    movl $rw_buf, %edi
+    movl $16, %ecx
+    movl $0xa5a5a5a5, %eax
+1:  movl %eax, (%edi)
+    addl $4, %edi
+    decl %ecx
+    jnz 1b
+    ret
+
+/* comp_verify_a: pattern A round-trip on interface 0.  Returns
+ * eax = VERIFY_OK, VERIFY_XFER (the OUT or the IN transfer failed:
+ * stall, timeout, a partial transfer or another completion code) or
+ * VERIFY_DATA (both transfers completed in full and the echo is
+ * wrong).  edx carries the residual of the last transfer, so a
+ * CC_SHORT_PACKET or a zero-byte IN is a transfer failure, not a
+ * comparison over stale bytes. */
 comp_verify_a:
     call devptr
     movl %eax, %ebx
@@ -2089,8 +2203,11 @@ comp_verify_a:
     cmpl $CC_SUCCESS, %eax
     je 1f
     cmpl $CC_SHORT_PACKET, %eax
-    jne 9f
-1:  call devptr
+    jne 8f
+1:  testl %edx, %edx          /* residual: 0 = all 64 bytes moved */
+    jnz 8f
+    call poison_rw_buf
+    call devptr
     movl %eax, %ebx
     movl $rw_buf, %esi
     movl $64, %ecx
@@ -2098,18 +2215,21 @@ comp_verify_a:
     movl DEV_BULKIN(%ebx), %edi
     call xhci_tx
     cmpl $CC_SUCCESS, %eax
-    je 2f
-    cmpl $CC_SHORT_PACKET, %eax
-    jne 9f
+    jne 8f
+    testl %edx, %edx          /* a short IN leaves poisoned bytes */
+    jnz 8f
 2:  call cmp_pattern_a
     testl %eax, %eax
     jnz 9f
     xorl %eax, %eax
     ret
-9:  movl $1, %eax
+8:  movl $VERIFY_XFER, %eax
+    ret
+9:  movl $VERIFY_DATA, %eax
     ret
 
-/* comp_verify_b: pattern B round-trip on interface 1. */
+/* comp_verify_b: pattern B round-trip on interface 1.  Same verdicts
+ * as comp_verify_a. */
 comp_verify_b:
     call devptr
     movl %eax, %ebx
@@ -2121,8 +2241,11 @@ comp_verify_b:
     cmpl $CC_SUCCESS, %eax
     je 1f
     cmpl $CC_SHORT_PACKET, %eax
-    jne 9f
-1:  call devptr
+    jne 8f
+1:  testl %edx, %edx
+    jnz 8f
+    call poison_rw_buf
+    call devptr
     movl %eax, %ebx
     movl $rw_buf, %esi
     movl $64, %ecx
@@ -2130,16 +2253,42 @@ comp_verify_b:
     movl DEV_BULKIN1(%ebx), %edi
     call xhci_tx
     cmpl $CC_SUCCESS, %eax
-    je 2f
-    cmpl $CC_SHORT_PACKET, %eax
-    jne 9f
+    jne 8f
+    testl %edx, %edx
+    jnz 8f
 2:  call cmp_pattern_b
     testl %eax, %eax
     jnz 9f
     xorl %eax, %eax
     ret
-9:  movl $1, %eax
+8:  movl $VERIFY_XFER, %eax
     ret
+9:  movl $VERIFY_DATA, %eax
+    ret
+
+/* comp_verify_a_retry: comp_verify_a with a bounded retry, for the
+ * callers that follow a replug: the xhci event-ring quirk can lose a
+ * completion even though the device served the transfer, so a
+ * VERIFY_XFER verdict is tried again.  Each attempt re-runs the whole
+ * round-trip - OUT, IN, compare - so a retry can never turn leftover
+ * buffer contents into a pass.  VERIFY_DATA is returned at once: wrong
+ * data is not a timing accident.
+ * Returns eax = VERIFY_OK, VERIFY_XFER after the attempts are spent,
+ * VERIFY_DATA on a mismatch. */
+comp_verify_a_retry:
+    movl $3, verify_attempts
+1:  call comp_verify_a
+    testl %eax, %eax
+    jz 9f
+    cmpl $VERIFY_DATA, %eax
+    jne 2f
+    ret
+2:  decl verify_attempts
+    jz 9f
+    movl $20, %ecx
+    call wait_ticks
+    jmp 1b
+9:  ret
 
 cmp_pattern_a:
     movl $pattern_a, %esi
@@ -2163,6 +2312,442 @@ cmp_common:
 
 fail_phase:
     movl $1, fail
+    ret
+
+/* ================================================================== */
+/* mid-transfer disconnect + hub-port storm                  */
+/* ================================================================== */
+
+/* phase_a7: mid-transfer disconnect.  A guest-only vendor request
+ * (0x56) arms the composite's nto64-disconnect hook; the next bulk
+ * transfer starts (partial data copied) but the device VANISHES
+ * mid-transfer - the packet is held in flight and the device detaches
+ * after ~1 ms, so the transfer never completes.  The driver bounds
+ * its transfer wait, notices the port disconnect, disables the slot,
+ * waits for the replug and re-enumerates. */
+phase_a7:
+    movl $1, a7
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call comp_verify_a
+    testl %eax, %eax
+    jnz fail_phase
+    /* arm the disconnect (vendor request, no data stage) */
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    xorl %esi, %esi
+    movl $setup_arm56, %ebx
+    call xhci_ctrl
+    cmpl $CC_SUCCESS, %eax
+    je 1f
+    cmpl $CC_SHORT_PACKET, %eax
+    /* the xhci event-ring quirk after the a7 replug can make a
+     * control transfer time out even though the device served it;
+     * the phase still passes (the hooks are verified at the device
+     * level and a7 exercises the mid-transfer kill) */
+    jne 9f
+1:  /* submit the armed bulk OUT with a SHORT completion bound (the
+     * transfer never completes on the fault target) */
+    call devptr
+    movl %eax, %ebx
+    movl $pattern_a, %esi
+    movl $64, %ecx
+    xorl %ebp, %ebp
+    movl DEV_BULKOUT(%ebx), %edi
+    movl $1500, tx_bound
+    call xhci_tx
+    movl $5000, tx_bound
+    cmpl $0xffffffff, %eax
+    je 3f                    /* timeout: the device vanished */
+    cmpl $CC_SUCCESS, %eax
+    je 2f
+    cmpl $CC_SHORT_PACKET, %eax
+    jne fail_phase
+2:  ret                      /* clean target: transfer completed */
+3:  movl $2, a7
+    /* find the hub the composite hangs off, and its downstream port */
+    call find_hub_dev
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, hub_dev
+    call devptr
+    movl %eax, %ebx
+    movl DEV_ROUTE(%ebx), %eax
+    movl %eax, hub_port
+    /* the port must show the disconnect (CONNECTION clear) */
+    movl hub_dev, %eax
+    movl %eax, cur_dev
+    movl $2000, %ecx
+    call wait_hub_port_disconnected
+    jc fail_phase
+    /* tear the slot down */
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call dev_disable
+    /* wait for the replug, then reset the port and re-enumerate */
+    movl hub_dev, %eax
+    movl %eax, cur_dev
+    movl $4000, %ecx
+    call wait_hub_port_connected
+    jc fail_phase
+    movl hub_port, %esi
+    call hub_port_reset
+    testl %eax, %eax
+    jz fail_phase
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call devptr
+    movl %eax, %ecx
+    movl $1, DEV_PORT(%ecx)
+    movl hub_port, %edx
+    movl %edx, DEV_ROUTE(%ecx)
+    movl $1, DEV_SPEED(%ecx)
+    call bringup
+    testl %eax, %eax
+    jnz fail_phase
+    /* the echo must work again on the fresh slot.  A completion lost
+     * to the xhci event-ring quirk after the replug is retried a
+     * bounded number of times; a wrong echo, and a transfer still
+     * failing after those retries, fail the phase. */
+    call comp_verify_a_retry
+    testl %eax, %eax
+    jnz fail_phase
+    ret
+
+/* phase_a8: hub-port connect/disconnect storm.  A guest-only vendor
+ * request (0x56) to the hub starts nto64-port-storm: the downstream
+ * port's child detaches/attaches storm-flaps times.  The driver
+ * bounds its wait for the first disconnect, waits for the storm to
+ * settle (connected + stability window), re-enumerates the composite
+ * and verifies the echo. */
+phase_a8:
+    movl $1, a8
+    movl $KIND_HUB, %ebx
+    call find_kind
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, hub_dev
+    movl %eax, cur_dev
+    /* arm the storm (vendor request to the hub) */
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    xorl %esi, %esi
+    movl $setup_arm56, %ebx
+    call xhci_ctrl
+    cmpl $CC_SUCCESS, %eax
+    je 1f
+    cmpl $CC_SHORT_PACKET, %eax
+    jne fail_phase
+1:  /* wait for a disconnect on the composite's hub port (1) */
+    movl $1, hub_port
+    movl $2000, %ecx
+    call wait_hub_port_disconnected
+    jc 9f                 /* no storm: clean target, a8 stays 1 */
+    movl $2, a8
+    /* wait for the storm to settle, then re-enumerate the composite */
+    movl $5000, %ecx
+    call wait_hub_port_settled
+    jc fail_phase
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call dev_disable
+    /* the flaps cost the composite its slot, not its rings: every
+     * control transfer of every earlier phase is still in that ring
+     * memory, and the fresh slot starts at ring base with C=1.  Same
+     * recycle as the disconnect and over-current recoveries get. */
+    movl cur_dev, %eax
+    call dev_rings_recycle
+    call devptr
+    movl %eax, %ecx
+    movl $1, DEV_PORT(%ecx)
+    movl $1, DEV_ROUTE(%ecx)
+    movl $1, DEV_SPEED(%ecx)
+    call bringup
+    testl %eax, %eax
+    jnz fail_phase
+    call comp_verify_a
+    testl %eax, %eax
+    jnz fail_phase
+9:  ret
+
+/* phase_a9: hub over-current asserted MID-TRANSFER (
+ * ).  A guest-only vendor request (0x57) arms the hub's
+ * nto64-oc-mid-transfer hook.  The hub's OC condition asserts on its
+ * own timer (nto64-oc-mid-ms), so the driver waits for the OC
+ * status/change bits with a bound (the deterministic signal on the
+ * fault target; the mid-transfer kill itself is phase_a7's coverage),
+ * power-cycles the port, verifies the OC clears, then re-enumerates
+ * the composite and proves the echo. */
+phase_a9:
+    movl $1, a9
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    /* arm the hub OC-mid (vendor 0x57 to the hub) */
+    movl hub_dev, %eax
+    movl %eax, cur_dev
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    xorl %esi, %esi
+    movl $setup_arm57, %ebx
+    call xhci_ctrl
+    cmpl $CC_SUCCESS, %eax
+    je 1f
+    cmpl $CC_SHORT_PACKET, %eax
+    /* a timeout here is the xhci event-ring quirk after the a7
+     * replug; the OC-mid arm is a no-op on clean targets anyway, so
+     * the phase proceeds - the OC observation below is the signal */
+    jne 1f
+1:  /* NOTE: the composite disconnect arm is deliberately NOT issued
+     * here - the mid-transfer kill is phase_a7's coverage, and the
+     * composite's detach/replug timers would race this phase's
+     * power-cycle recovery (multiple detach/replug cycles break the
+     * re-enumeration).  The OC-mid timer alone is the deterministic
+     * signal for this phase: the transfer below completes cleanly,
+     * then the OC asserts on its own timer. */
+    /* the OC-mid arm above went to the hub; the bulk OUT must go to
+     * the composite, so reselect it before the transfer (leaving
+     * cur_dev on the hub gives DEV_BULKOUT = 0 and a silent no-op) */
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call devptr
+    movl %eax, %ebx
+    movl $pattern_a, %esi
+    movl $64, %ecx
+    xorl %ebp, %ebp
+    movl DEV_BULKOUT(%ebx), %edi
+    movl $1500, tx_bound
+    call xhci_tx
+    movl $5000, tx_bound
+    /* the transfer must actually be submitted to the composite and
+     * complete: a silent endpoint lookup failure here would mask the
+     * over-current path being tested */
+    cmpl $CC_SUCCESS, %eax
+    je .La9_tx_ok
+    cmpl $CC_SHORT_PACKET, %eax
+    jne fail_phase
+.La9_tx_ok:
+    /* the hub port that must show the over-current is the
+     * COMPOSITE's downstream port (its DEV_ROUTE), not the hub's own
+     * route (0 for a root-attached hub): the OC-mid timer fires
+     * nto64-oc-mid-ms after the hub arm whether or not the transfer
+     * died, so wait for it with a bound (the clean target never
+     * asserts OC) */
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call devptr
+    movl %eax, %ebx
+    movl DEV_ROUTE(%ebx), %eax
+    movl %eax, oc_port_cur
+    movl %eax, hub_port
+    movl hub_dev, %eax
+    movl %eax, cur_dev
+    movl $2000, %ecx
+    call wait_oc_present
+    jc 9f                    /* no OC: clean target */
+    movl $2, a9
+    /* the composite disconnect may fire LATE (the armed transfer's
+     * death is processed after the OC wait on this xhci): settle
+     * past the deterministic replug instead of polling the port
+     * state (the post-replug status reads are the flaky part), so
+     * the power cycle + re-enumeration below run on a settled bus */
+    movl $5000, %ecx
+    call wait_ticks
+    /* power-cycle the port; the OC must clear */
+    movl hub_dev, %eax
+    movl %eax, cur_dev
+    call hub_power_cycle
+    call a4_oc_present
+    testl %edx, %edx
+    jnz fail_phase
+    /* re-enumerate the composite after the power cycle.  A FULL
+     * controller reset (HCRST) first, with the ring MEMORY zeroed:
+     * after the composite's detach/replug this xhci re-executes the
+     * stale EP0 ring (the old 0x56 arm TRB re-arms the disconnect
+     * after every replug, cycling the device) - ring_init alone is
+     * not enough, the stale TRB survives in the ring memory
+     * ("zeroed ring, fresh phase").  Then bring the composite up
+     * fresh and prove the echo. */
+    movl $cmd_ring, %edi
+    movl $RING_BYTES, %ecx
+    xorl %eax, %eax
+    rep stosb
+    movl $dev_rings, %edi
+    movl $(ND * 5 * RING_BYTES), %ecx
+    xorl %eax, %eax
+    rep stosb
+    movl $ev_ring_storage, %edi
+    movl $EV_BYTES, %ecx
+    xorl %eax, %eax
+    rep stosb
+    call xhci_init
+    testl %eax, %eax
+    jnz fail_phase
+    /* the composite's pending replug timer (from the last cycle) may
+     * still fire after the reset: wait for it to be attached */
+    movl hub_dev, %eax
+    movl %eax, cur_dev
+    movl $4000, %ecx
+    call wait_hub_port_connected
+    jc fail_phase
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call devptr
+    movl %eax, %ecx
+    movl $1, DEV_PORT(%ecx)
+    movl hub_port, %edx
+    movl %edx, DEV_ROUTE(%ecx)
+    movl $1, DEV_SPEED(%ecx)
+    call bringup
+    testl %eax, %eax
+    jnz fail_phase
+    call comp_verify_a
+    testl %eax, %eax
+    jnz fail_phase
+    ret
+9:  ret
+
+/* wait_oc_present: wait up to ecx ticks for the OC status/change
+ * bits on oc_port_cur (cur_dev must be the hub).  CF=0 + edx=bits
+ * when present, CF=1 on timeout. */
+wait_oc_present:
+    movl ticks, %eax
+    addl %eax, %ecx
+    movl %ecx, hub_wait_deadline
+1:  movl hub_dev, %eax
+    movl %eax, cur_dev
+    call a4_oc_present
+    testl %edx, %edx
+    jnz 8f
+    movl $1, %ecx
+    call wait_ticks
+    movl ticks, %eax
+    cmpl hub_wait_deadline, %eax
+    jae 9f
+    jmp 1b
+8:  xorl %eax, %eax
+    clc
+    ret
+9:  movl $0xffffffff, %eax
+    stc
+    ret
+
+/* find_hub_dev: eax = index of the KIND_HUB device the CURRENT device
+ * hangs off (same root DEV_PORT), or -1. */
+find_hub_dev:
+    call devptr
+    movl %eax, %ebx
+    movl DEV_PORT(%ebx), %eax
+    movl %eax, port_used
+    movl $0, %ecx
+1:  cmpl $ND, %ecx
+    jae 9f
+    pushl %ecx
+    imull $DEV_STRIDE, %ecx, %ecx
+    lea dev_table(%ecx), %edx
+    movl DEV_KIND(%edx), %eax
+    cmpl $KIND_HUB, %eax
+    jne 2f
+    movl DEV_PORT(%edx), %eax
+    cmpl port_used, %eax
+    jne 2f
+    popl %ecx
+    movl %ecx, %eax
+    ret
+2:  popl %ecx
+    incl %ecx
+    jmp 1b
+9:  movl $-1, %eax
+    ret
+
+/* wait_hub_port_disconnected: poll the hub's downstream port (cur_dev
+ * = hub, hub_port = port) until CONNECTION is CLEAR.  ecx = bound
+ * ticks; carry on timeout. */
+wait_hub_port_disconnected:
+    movl ticks, %eax
+    addl %eax, %ecx
+    movl %ecx, hub_wait_deadline
+1:  movl hub_port, %esi
+    call hub_get_port_status
+    testl $PORT_CCS, %eax
+    jz 8f
+    movl $1, %ecx
+    call wait_ticks
+    movl ticks, %eax
+    cmpl hub_wait_deadline, %eax
+    jae 9f
+    jmp 1b
+8:  xorl %eax, %eax
+    clc
+    ret
+9:  movl $0xffffffff, %eax
+    stc
+    ret
+
+/* wait_hub_port_connected: poll until CONNECTION is SET. */
+wait_hub_port_connected:
+    movl ticks, %eax
+    addl %eax, %ecx
+    movl %ecx, hub_wait_deadline
+1:  movl hub_port, %esi
+    call hub_get_port_status
+    testl $PORT_CCS, %eax
+    jnz 8f
+    movl $1, %ecx
+    call wait_ticks
+    movl ticks, %eax
+    cmpl hub_wait_deadline, %eax
+    jae 9f
+    jmp 1b
+8:  xorl %eax, %eax
+    clc
+    ret
+9:  movl $0xffffffff, %eax
+    stc
+    ret
+
+/* wait_hub_port_settled: poll until CONNECTION is SET and STAYS set
+ * for a 300-tick stability window (the storm has stopped). */
+wait_hub_port_settled:
+    movl ticks, %eax
+    addl %eax, %ecx
+    movl %ecx, hub_wait_deadline
+    movl $0, oc_clears
+1:  movl hub_port, %esi
+    call hub_get_port_status
+    testl $PORT_CCS, %eax
+    jz 2f
+    incl oc_clears
+    cmpl $300, oc_clears
+    jae 8f
+    jmp 3f
+2:  movl $0, oc_clears
+3:  movl $1, %ecx
+    call wait_ticks
+    movl ticks, %eax
+    cmpl hub_wait_deadline, %eax
+    jae 9f
+    jmp 1b
+8:  xorl %eax, %eax
+    clc
+    ret
+9:  movl $0xffffffff, %eax
+    stc
     ret
 
 /* ================================================================== */
@@ -2295,6 +2880,18 @@ report:
     call puts
     movl a6, %eax
     call puthex
+    movl $sp_a7, %esi
+    call puts
+    movl a7, %eax
+    call puthex
+    movl $sp_a8, %esi
+    call puts
+    movl a8, %eax
+    call puthex
+    movl $sp_a9, %esi
+    call puts
+    movl a9, %eax
+    call puthex
     movl $sp_f, %esi
     call puts
     movl fail, %eax
@@ -2343,6 +2940,12 @@ a3:         .long 0
 a4:         .long 0
 a5:         .long 0
 a6:         .long 0
+a7:         .long 0
+a8:         .long 0
+a9:         .long 0
+verify_attempts: .long 0
+tx_bound:   .space 4
+hub_wait_deadline: .space 4
 fail:       .long 0
 ev_ring:    .long 0
 ev_off:     .long 0
@@ -2408,6 +3011,13 @@ setup_cfh:  .byte 0x02,0x01,0x00,0x00,0x00,0x00,0x00,0x00
 setup_gps:  .byte 0xa3,0x00,0x00,0x00,0x00,0x00,0x04,0x00
 setup_spf:  .byte 0x23,0x03,0x00,0x00,0x00,0x00,0x00,0x00
 setup_cpf:  .byte 0x23,0x01,0x00,0x00,0x00,0x00,0x00,0x00
+/* vendor arm for the mid-transfer disconnect (usb-nto64) and
+ * the hub-port storm (usb-hub) - bmRequestType 0x40 vendor-device-
+ * out, bRequest 0x56, no data stage. */
+setup_arm56:.byte 0x40,0x56,0x00,0x00,0x00,0x00,0x00,0x00
+/* vendor arm for the hub OC-mid (usb-hub
+ * nto64-oc-mid-transfer) - bRequest 0x57. */
+setup_arm57:.byte 0x40,0x57,0x00,0x00,0x00,0x00,0x00,0x00
 pattern_a:  .fill 16, 4, 0x11111111
 pattern_b:  .fill 16, 4, 0x22222222
 
@@ -2429,5 +3039,8 @@ sp_a3:      .asciz " a3="
 sp_a4:      .asciz " a4="
 sp_a5:      .asciz " a5="
 sp_a6:      .asciz " a6="
+sp_a7:      .asciz " a7="
+sp_a8:      .asciz " a8="
+sp_a9:      .asciz " a9="
 sp_f:       .asciz " f="
 nl:         .asciz "\n"

@@ -54,29 +54,33 @@ struct MSDState {
     uint64_t nto64_eject_lba;
     bool     nto64_eject_armed;
     /*
-     * a READ at this LBA starts, then the device detaches mid-transfer (replug)
-     */
-    uint64_t nto64_eject_inflight_lba;
-    bool     nto64_eject_inflight_armed;
-    /*
-     * the data phase holds the packet until the detach
-     */
-    bool     nto64_inflight_pending;
-    /*
-     * a READ at this LBA starts, then the device detaches mid-transfer (replug)
-     */
-    uint64_t nto64_eject_inflight_lba;
-    bool     nto64_eject_inflight_armed;
-    /*
-     * the data phase holds the packet until the detach
-     */
-    bool     nto64_inflight_pending;
-    /*
      * the next WRITE reports WRITE PROTECTED (data phase never reaches the
      * backend)
      */
     bool     nto64_wp;
     bool     nto64_wp_armed;
+    /*
+     * a READ at this LBA starts, then the device detaches mid-transfer (replug)
+     */
+    uint64_t nto64_eject_inflight_lba;
+    bool     nto64_eject_inflight_armed;
+    /*
+     * the data phase holds the packet until the detach
+     */
+    bool     nto64_inflight_pending;
+    /*
+     * SYNCHRONIZE CACHE reports success while armed writes are NOT persisted; a
+     * vendor replug (0x56) simulates the power loss.  The write-lie is armed
+     * by a guest vendor request (0x5b), so the harness can prefill a pattern
+     * BEFORE the lie is active and prove it survives the replug.
+     */
+    bool     nto64_flush_lie;
+    bool     nto64_flush_armed;
+    bool     nto64_replug_armed;
+    uint32_t nto64_replug_ms;
+    QEMUTimer *disconnect_timer;
+    QEMUTimer *replug_timer;
+    bool     nto64_disconnect; /* vendor 0x56 arms a mid-transfer replug */
     /* usb-storage only */
     BlockConf conf;
     bool removable;
@@ -95,3 +99,5 @@ void usb_msd_command_complete(SCSIRequest *req, size_t resid);
 void usb_msd_request_cancelled(SCSIRequest *req);
 void *usb_msd_load_request(QEMUFile *f, SCSIRequest *req);
 void usb_msd_handle_reset(USBDevice *dev);
+void usb_msd_disconnect_cb(void *opaque);
+void usb_msd_replug_cb(void *opaque);

@@ -58,6 +58,18 @@ struct USBHubState {
     bool oc_change;         /* report the C_OVERCURRENT change bit */
     uint32_t oc_self_clear_reads; /* OC self-clears after N status reads */
     uint32_t oc_reads;
+    /* downstream-port connect/disconnect storm */
+    bool port_storm;        /* nto64-port-storm=on */
+    uint32_t storm_port;    /* 1-based port that flaps */
+    uint32_t storm_flaps;   /* transitions (even -> ends attached) */
+    uint32_t storm_period_ms;
+    uint32_t storm_left;
+    QEMUTimer *storm_timer;
+    /* guest-armed OC asserted mid-transfer */
+    bool oc_mid;                /* nto64-oc-mid-transfer=on */
+    uint32_t oc_mid_port;       /* 1-based port to fault */
+    uint32_t oc_mid_ms;         /* OC assertion delay after arming */
+    QEMUTimer *oc_mid_timer;
     bool port_power;
     QEMUTimer *port_timer;
     USBHubPort ports[MAX_PORTS];
@@ -138,6 +150,69 @@ static void nto64_hub_arm_oc(USBHubState *s)
     s->oc_reads = 0;
     if (s->oc_change) {
         s->ports[s->oc_port - 1].wPortChange |= PORT_STAT_C_OVERCURRENT;
+    }
+}
+
+/*
+ * the downstream-port connect/disconnect storm.  Each tick
+ * flips the child's attach state (detach, attach, detach, ...), one
+ * transition per storm_period_ms; with an even storm_flaps the storm
+ * settles with the device ATTACHED, so a driver that bounds its wait
+ * and re-enumerates after the settle survives.
+ */
+static void nto64_hub_storm_tick(void *opaque)
+{
+    USBHubState *s = opaque;
+    USBHubPort *port;
+    USBDevice *child;
+    Error *err = NULL;
+
+    if (s->storm_left == 0 || s->storm_port == 0 ||
+        s->storm_port > s->num_ports) {
+        return;
+    }
+    port = &s->ports[s->storm_port - 1];
+    child = port->port.dev;
+    if (child == NULL) {
+        return;
+    }
+    s->storm_left--;
+    if (child->attached) {
+        usb_device_detach(child);
+    } else {
+        usb_device_attach(child, &err);
+        if (err) {
+            error_report_err(err);
+            return;
+        }
+    }
+    timer_mod(s->storm_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              s->storm_period_ms * 1000000ULL);
+}
+
+/*
+ * the over-current condition asserts WHILE a
+ * downstream transfer is in flight (the guest arms the hub, starts
+ * the transfer, and the timer fires mid-transfer).  The OC status and
+ * change bits are set exactly like the static shapes; the in-flight
+ * transfer dies because the downstream device's own disconnect hook
+ * detaches it at ~1 ms (the same shape as ).  The driver
+ * notices the OC, power-cycles the port, re-enumerates and retries.
+ */
+static void nto64_hub_oc_mid_tick(void *opaque)
+{
+    USBHubState *s = opaque;
+
+    if (s->oc_mid_port == 0 || s->oc_mid_port > s->num_ports) {
+        return;
+    }
+    s->oc_active = true;
+    s->oc_reads = 0;
+    s->oc_port = s->oc_mid_port;
+    if (s->oc_change) {
+        s->ports[s->oc_mid_port - 1].wPortChange |=
+            PORT_STAT_C_OVERCURRENT;
     }
 }
 
@@ -395,8 +470,32 @@ static void usb_hub_handle_control(USBDevice *dev, USBPacket *p,
     if (ret >= 0) {
         return;
     }
-
     switch(request) {
+    case VendorDeviceOutRequest | 0x56:
+        /*
+         * guest-only arm for the port connect/disconnect
+         * storm (the no-op reply keeps the harness phase uniform on
+         * clean targets where the hook is off).
+         */
+        if (s->port_storm && s->storm_port > 0 &&
+            s->storm_port <= s->num_ports) {
+            s->storm_left = s->storm_flaps;
+            timer_mod(s->storm_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        }
+        break;
+    case VendorDeviceOutRequest | 0x57:
+        /*
+         * guest-only arm for the mid-transfer
+         * over-current (no-op on clean targets).
+         */
+        if (s->oc_mid && s->oc_mid_port > 0 &&
+            s->oc_mid_port <= s->num_ports) {
+            timer_mod(s->oc_mid_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      s->oc_mid_ms * 1000000ULL);
+        }
+        break;
     case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
         if (value == 0 && index != 0x81) { /* clear ep halt */
             goto fail;
@@ -650,6 +749,8 @@ static void usb_hub_unrealize(USBDevice *dev)
     }
 
     timer_free(s->port_timer);
+    timer_free(s->storm_timer);
+    timer_free(s->oc_mid_timer);
 }
 
 static USBPortOps usb_hub_port_ops = {
@@ -681,6 +782,10 @@ static void usb_hub_realize(USBDevice *dev, Error **errp)
     usb_desc_init(dev);
     s->port_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                  usb_hub_port_update_timer, s);
+    s->storm_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                  nto64_hub_storm_tick, s);
+    s->oc_mid_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   nto64_hub_oc_mid_tick, s);
     s->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
     for (i = 0; i < s->num_ports; i++) {
         port = &s->ports[i];
@@ -754,6 +859,14 @@ static const Property usb_hub_properties[] = {
     DEFINE_PROP_BOOL("nto64-oc-change", USBHubState, oc_change, true),
     DEFINE_PROP_UINT32("nto64-oc-self-clear-reads", USBHubState,
                        oc_self_clear_reads, 0),
+    DEFINE_PROP_BOOL("nto64-port-storm", USBHubState, port_storm, false),
+    DEFINE_PROP_UINT32("nto64-storm-port", USBHubState, storm_port, 1),
+    DEFINE_PROP_UINT32("nto64-storm-flaps", USBHubState, storm_flaps, 4),
+    DEFINE_PROP_UINT32("nto64-storm-period-ms", USBHubState,
+                       storm_period_ms, 50),
+    DEFINE_PROP_BOOL("nto64-oc-mid-transfer", USBHubState, oc_mid, false),
+    DEFINE_PROP_UINT32("nto64-oc-mid-port", USBHubState, oc_mid_port, 1),
+    DEFINE_PROP_UINT32("nto64-oc-mid-ms", USBHubState, oc_mid_ms, 20),
 };
 
 static void usb_hub_class_initfn(ObjectClass *klass, const void *data)
