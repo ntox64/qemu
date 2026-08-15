@@ -23,10 +23,15 @@
  *        (nto64-stall-intr) or returns a truncated report
  *        (nto64-bad-report) - the driver resets the endpoint, clears
  *        the halt and retries (one-shot)
- *   a4 - hub over-current: oc-port=N reports OVERCURRENT + the change
- *        bit; the driver power-cycles the port (clear/set PORT_POWER),
- *        resets it, re-enumerates the device and verifies the port is
- *        clean again (one-shot power-restore cycle)
+ *   a4 - hub over-current misbehaviour matrix: oc-port=N reports
+ *        OVERCURRENT (status and/or change bit); the driver detects
+ *        it either way, handles a chatty level-triggered change bit
+ *        with bounded clears, power-cycles a transient condition and
+ *        re-enumerates the device, bounds retries and masks the port
+ *        on a persistent fault, and keeps the device when the
+ *        condition self-clears - every shape leaves the rest of the
+ *        bus verified ( modes: nto64-oc-edge, -persistent,
+ *        -status, -change, -self-clear-reads)
  *   a5 - composite dead-function mask: usb-nto64,nto64-composite=on
  *        exposes two 64-byte bulk echo functions; nto64-kill-iface=N
  *        makes interface N stall every transfer.  The driver masks
@@ -45,6 +50,16 @@
  *                      CLEAR_FEATURE -> retry ok)
  *   run-usbbadreport:  a1=4 a3=2 (truncated report -> same recovery)
  *   run-usboc:         a1=4 a4=2 (OC -> power cycle -> re-enumerate)
+ *   run-usbocpersist:  a1=4 a4=2 (OC survives power cycles -> bounded
+ *                      retries -> port masked, rest of bus verified)
+ *   run-usboclevel:    a1=4 a4=2 (chatty change bit -> bounded clears,
+ *                      no spin -> power-cycle recovery)
+ *   run-usbocchange:   a1=4 a4=2 (change-bit-only hub -> still
+ *                      detected -> power-cycle recovery)
+ *   run-usbocstatus:   a1=4 a4=2 (status-bit-only hub -> still
+ *                      detected -> power-cycle recovery)
+ *   run-usbocclear:    a1=4 a4=2 (condition self-clears -> driver
+ *                      keeps the device, no over-reaction)
  *   run-usbdead:       a1=4 a5=2 (function B dead -> mask -> A alive
  *                      -> device reset -> re-mask)
  *   run-usbenum:       a1=3 a6=4 (four enumeration-fault devices
@@ -52,6 +67,9 @@
  *   run-usbpower:      a1=4 a6=1 (over-budget device rejected)
  * The HID data faults are armed by SET_IDLE (only the guest driver
  * sends it), so BIOS boot enumeration cannot consume them.
+ * The over-current fault is armed by the hub's SET_CONFIGURATION for
+ * the same reason (BIOS enumerates the hub and would consume an edge
+ * change bit / the self-clear read counter).
  *
  * Prints 'USB-BAD a1=... a2=... a3=... a4=... a5=... a6=... f=...'
  * and halts.  Machine: -machine pc -m 64, -device qemu-xhci,p3=0
@@ -1810,9 +1828,12 @@ mouse_read_report:
 1:  xorl %eax, %eax
     ret
 
-/* phase_a4: hub over-current.  A port reporting OVERCURRENT (status +
- * change) is power-cycled (clear/set PORT_POWER), reset, and its
- * device re-enumerated; the port must then be clean. */
+/* phase_a4: hub over-current misbehaviour matrix.  The
+ * driver detects OC by the status OR change bit, handles a chatty
+ * (level-triggered) change bit with bounded clears, power-cycles a
+ * transient condition (then re-enumerates), bounds retries and masks
+ * a persistent one, and keeps the device when the condition
+ * self-clears.  Every shape ends with the rest of the bus verified. */
 phase_a4:
     movl $1, a4
     movl $KIND_HUB, %ebx
@@ -1821,16 +1842,36 @@ phase_a4:
     je fail_phase
     movl %eax, hub_dev
     movl $1, oc_port_cur
-1:  cmpl $4, oc_port_cur
-    ja 9f
+a4_scan:
+    cmpl $4, oc_port_cur
+    ja a4_ret
     movl hub_dev, %eax
     movl %eax, cur_dev
     movl oc_port_cur, %esi
     call hub_get_port_status
-    testl $0x0008, %eax       /* PORT_STAT_OVERCURRENT */
-    jz 2f
+    movl %eax, %ebp
+    andl $0x8, %ebp            /* status OC bit */
+    movzbl hub_status_buf+2, %eax
+    andl $0x8, %eax            /* change OC bit */
+    movl %ebp, %edx
+    orl %eax, %edx
+    testl %edx, %edx
+    jz a4_next
     movl $2, a4
-    /* condition persists across clearing the change bit */
+    testl %ebp, %ebp
+    jnz a4_have_status
+    /* change-only hub: the OC change event alone justifies the
+     * power-cycle recovery */
+    jmp a4_power_recover
+a4_next:
+    incl oc_port_cur
+    jmp a4_scan
+a4_have_status:
+    /* bounded change-bit clear loop: a chatty hub re-asserts the
+     * change bit on every read; the driver must not spin (max 4) */
+    movl $0, oc_clears
+a4_clrloop:
+    incl oc_clears
     movl $PORT_FEAT_C_OVERCURRENT, %ebx
     movl oc_port_cur, %esi
     call hub_clear_feature
@@ -1838,9 +1879,78 @@ phase_a4:
     movl %eax, cur_dev
     movl oc_port_cur, %esi
     call hub_get_port_status
-    testl $0x0008, %eax
-    jz fail_phase
-    /* power-restore cycle: off, on, reset */
+    movl %eax, %ebp
+    andl $0x8, %ebp
+    movzbl hub_status_buf+2, %eax
+    andl $0x8, %eax
+    movl %ebp, %edx
+    orl %eax, %edx
+    testl %edx, %edx
+    jz a4_self_clear
+    testl %eax, %eax
+    jz a4_power_recover       /* edge hub: change bit stayed clear */
+    cmpl $4, oc_clears
+    jae a4_power_recover
+    jmp a4_clrloop
+a4_power_recover:
+    call hub_power_cycle
+    call a4_oc_present
+    testl %edx, %edx
+    jz a4_reenum
+    /* still over-current: persistent hub - one more cycle, then mask */
+    call hub_power_cycle
+    call a4_oc_present
+    testl %edx, %edx
+    jz a4_reenum
+    /* persistent fault: mask the port, keep the rest of the bus alive */
+    call a4_verify_comp
+    testl %eax, %eax
+    jnz fail_phase
+    jmp a4_ret
+a4_reenum:
+    call find_route_dev
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call dev_disable
+    call bringup
+    testl %eax, %eax
+    jnz fail_phase
+    /* the port must now be clean */
+    call a4_oc_present
+    testl %edx, %edx
+    jnz fail_phase
+    jmp a4_ret
+a4_self_clear:
+    /* the condition cleared on its own: keep the device, do NOT
+     * power-cycle it; verify the port is clean and the bus is alive */
+    call a4_oc_present
+    testl %edx, %edx
+    jnz fail_phase
+    call a4_verify_comp
+    testl %eax, %eax
+    jnz fail_phase
+a4_ret:
+    ret
+
+/* a4_oc_present: re-read oc_port_cur; edx = status|change OC bits
+ * (nonzero = the condition is still reported). */
+a4_oc_present:
+    movl hub_dev, %eax
+    movl %eax, cur_dev
+    movl oc_port_cur, %esi
+    call hub_get_port_status
+    movl %eax, %ebp
+    andl $0x8, %ebp
+    movzbl hub_status_buf+2, %eax
+    andl $0x8, %eax
+    movl %ebp, %edx
+    orl %eax, %edx
+    ret
+
+/* hub_power_cycle: power-cycle oc_port_cur (clear/set PORT_POWER,
+ * wait, port reset).  cur_dev must be the hub. */
+hub_power_cycle:
     movl $PORT_FEAT_POWER, %ebx
     movl oc_port_cur, %esi
     call hub_clear_feature
@@ -1853,26 +1963,19 @@ phase_a4:
     movl %eax, cur_dev
     movl oc_port_cur, %esi
     call hub_port_reset
-    /* re-enumerate the device on the affected port */
-    call find_route_dev
+    ret
+
+/* a4_verify_comp: the composite function A echo still works (the
+ * non-OC'd part of the bus is unaffected).  eax = 0 ok. */
+a4_verify_comp:
+    call find_composite
     cmpl $-1, %eax
-    je fail_phase
+    je 9f
     movl %eax, cur_dev
-    call dev_disable
-    call bringup
-    testl %eax, %eax
-    jnz fail_phase
-    /* the port must now be clean */
-    movl hub_dev, %eax
-    movl %eax, cur_dev
-    movl oc_port_cur, %esi
-    call hub_get_port_status
-    testl $0x0008, %eax
-    jnz fail_phase
-    jmp 9f
-2:  incl oc_port_cur
-    jmp 1b
-9:  ret
+    call comp_verify_a
+    ret
+9:  movl $1, %eax
+    ret
 
 /* find_route_dev: eax = index of the non-hub device on the current
  * hub's port oc_port_cur (root port = the hub's DEV_PORT). */
@@ -2229,6 +2332,7 @@ parse_len:  .long 0
 tx_ring:    .long 0
 ring_dev:   .long 0
 oc_port_cur: .long 0
+oc_clears:  .long 0
 ticks:      .long 0
 wait_target:.long 0
 ev_deadline:.long 0

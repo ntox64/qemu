@@ -1657,6 +1657,7 @@ run_phases:
     cmpl $0x50, proto
     jne 1f
     call phase_a7
+    call phase_a8
     call phase_a11
 1:
     ret
@@ -1879,6 +1880,55 @@ phase_a7:
     ret
 9:  movl $1, fail
     ret
+/* phase_a8: WRITE-PROTECT (usb-storage nto64-write-protect=on).  The
+ * guest arms the hook, then a WRITE must fail CLEANLY with the
+ * WRITE-PROTECTED sense - no silent success, no image corruption. */
+phase_a8:
+    movl $1, a8
+    call pattern_fill
+    movl $6000, %ebx
+    call transport_write
+    cmpl $0, %eax
+    jne 9f
+    movl $setup_arm58, %ebx
+    call arm_vendor
+    call get_hook_status
+    testl %eax, %eax
+    jnz 9f
+    movl hook_status, %eax
+    andl $2, %eax
+    testl %eax, %eax
+    jz 1f                    /* hook absent: the write must succeed */
+1:  /* the armed WRITE must fail (CHECK CONDITION / WRITE PROTECTED) */
+    call pattern_fill
+    movl $6000, %ebx
+    call transport_write
+    testl %eax, %eax
+    jz 2f
+    /* write failed: the fault is live */
+    movl hook_status, %eax
+    andl $2, %eax
+    testl %eax, %eax
+    jz 9f                    /* write failed but no hook: real error */
+    movl $2, a8
+    jmp 3f
+2:  movl hook_status, %eax
+    andl $2, %eax
+    testl %eax, %eax
+    jnz 9f                   /* hook present but write succeeded: lie */
+3:  /* read-back must still hold the pre-write pattern */
+    movl $6000, %ebx
+    call transport_read
+    testl %eax, %eax
+    jnz 9f
+    call verify_pattern
+    testl %eax, %eax
+    jnz 9f
+    ret
+9:  movl $1, fail
+    ret
+
+
 
 /* ================================================================== */
 /* eject DURING an in-flight transfer             */
@@ -2406,6 +2456,10 @@ rw_retry_read:
 
 /* pattern fill helpers */
 pattern_write:
+    movl $sp_a8, %esi
+    call puts
+    movl a8, %eax
+    call puthex
     call pattern_fill
     xorl %ebx, %ebx
     call transport_write
@@ -2470,6 +2524,7 @@ verify_pattern:
 /* ================================================================== */
 /* helpers                                                           */
 /* ================================================================== */
+a8:         .long 0
 op_read:
     addl op_base, %eax
     movl (%eax), %eax
@@ -2555,6 +2610,7 @@ putc:
     pushl %eax
 1:  movl $0x3fd, %edx
     inb %dx, %al
+setup_arm58: .byte 0x40,0x58,0x00,0x00,0x00,0x00,0x00,0x00
     testb $0x20, %al
     jz 1b
     movl $0x3f8, %edx
@@ -2585,6 +2641,7 @@ report:
     call puts
     movl a2, %eax
     call puthex
+sp_a8:      .asciz " a8="
     movl $sp_a3, %esi
     call puts
     movl a3, %eax

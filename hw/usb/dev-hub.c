@@ -48,6 +48,16 @@ struct USBHubState {
     uint32_t num_ports;
     uint32_t oc_port;       /* port reporting over-current (0=none) */
     bool oc_active;         /* over-current condition present */
+    /*
+     * over-current misbehaviour modes (a hub that breaks the
+     * USB 2.0 change-bit / power-switching model in each axis).
+     */
+    bool oc_edge;           /* edge-triggered change bit (spec) - off = chatty */
+    bool oc_persistent;     /* OC survives a port power cycle (broken hub) */
+    bool oc_status;         /* report the OVERCURRENT status bit */
+    bool oc_change;         /* report the C_OVERCURRENT change bit */
+    uint32_t oc_self_clear_reads; /* OC self-clears after N status reads */
+    uint32_t oc_reads;
     bool port_power;
     QEMUTimer *port_timer;
     USBHubPort ports[MAX_PORTS];
@@ -110,6 +120,26 @@ static const USBDescStrings desc_strings = {
     [STR_PRODUCT]      = "QEMU USB Hub",
     [STR_SERIALNUMBER] = "314159",
 };
+
+/*
+ * arm the over-current fault (condition + edge change bit +
+ * a fresh self-clear counter).  Called on every SET_CONFIGURATION so
+ * the guest driver's own set-config - the last one before its fault
+ * phases - is the deterministic arming point; BIOS boot enumeration
+ * also sets the hub config and would otherwise consume the edge
+ * change bit / self-clear reads.
+ */
+static void nto64_hub_arm_oc(USBHubState *s)
+{
+    if (s->oc_port == 0) {
+        return;
+    }
+    s->oc_active = true;
+    s->oc_reads = 0;
+    if (s->oc_change) {
+        s->ports[s->oc_port - 1].wPortChange |= PORT_STAT_C_OVERCURRENT;
+    }
+}
 
 static const USBDescIface desc_iface_hub = {
     .bInterfaceNumber              = 0,
@@ -357,6 +387,10 @@ static void usb_hub_handle_control(USBDevice *dev, USBPacket *p,
 
     trace_usb_hub_control(s->dev.addr, request, value, index, length);
 
+    if (request == (DeviceOutRequest | USB_REQ_SET_CONFIGURATION)) {
+        nto64_hub_arm_oc(s);
+    }
+
     ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
     if (ret >= 0) {
         return;
@@ -392,13 +426,31 @@ static void usb_hub_handle_control(USBDevice *dev, USBPacket *p,
             data[2] = port->wPortChange;
             data[3] = port->wPortChange >> 8;
             if (s->oc_active && s->oc_port == index) {
-                /*
-                 * the port is in over-current: the status
-                 * bit persists and the change bit re-asserts until the
-                 * driver clears it (or power-cycles the port).
-                 */
-                data[0] |= PORT_STAT_OVERCURRENT;
-                data[2] |= PORT_STAT_C_OVERCURRENT;
+                s->oc_reads++;
+                if (s->oc_self_clear_reads &&
+                    s->oc_reads >= s->oc_self_clear_reads) {
+                    /*
+                     * the condition clears on its own (a
+                     * transient fault the driver must not over-react
+                     * to with a power cycle).
+                     */
+                    s->oc_active = false;
+                }
+                if (s->oc_active) {
+                    if (s->oc_status) {
+                        data[0] |= PORT_STAT_OVERCURRENT;
+                    }
+                    if (s->oc_change && !s->oc_edge) {
+                        /*
+                         * a chatty (non-compliant) hub
+                         * re-asserts the change bit on every read
+                         * while the condition persists; the spec is
+                         * edge-triggered (the bit was set once at
+                         * assertion and the host clears it).
+                         */
+                        data[2] |= PORT_STAT_C_OVERCURRENT;
+                    }
+                }
             }
             p->actual_length = 4;
         }
@@ -491,9 +543,11 @@ static void usb_hub_handle_control(USBDevice *dev, USBPacket *p,
                     port->wPortChange = 0;
                     /*
                      * power-restore cycle: killing the port power ends
-                     * the over-current condition
+                     * the over-current condition (unless the hub is
+                     * broken and the fault persists)
                      */
-                    if (s->oc_active && s->oc_port == index) {
+                    if (s->oc_active && s->oc_port == index &&
+                        !s->oc_persistent) {
                         s->oc_active = false;
                     }
                 }
@@ -628,9 +682,6 @@ static void usb_hub_realize(USBDevice *dev, Error **errp)
     s->port_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                  usb_hub_port_update_timer, s);
     s->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
-    if (s->oc_port != 0) {
-        s->oc_active = true;
-    }
     for (i = 0; i < s->num_ports; i++) {
         port = &s->ports[i];
         usb_register_port(usb_bus_from_device(dev),
@@ -639,6 +690,13 @@ static void usb_hub_realize(USBDevice *dev, Error **errp)
         usb_port_location(&port->port, dev->port, i+1);
     }
     usb_hub_handle_reset(dev);
+    if (s->oc_port != 0) {
+        s->oc_active = true;
+        if (s->oc_change) {
+            /* edge-triggered: set the change bit once at assertion */
+            s->ports[s->oc_port - 1].wPortChange |= PORT_STAT_C_OVERCURRENT;
+        }
+    }
 }
 
 static const VMStateDescription vmstate_usb_hub_port = {
@@ -690,6 +748,12 @@ static const Property usb_hub_properties[] = {
     DEFINE_PROP_UINT32("ports", USBHubState, num_ports, 8),
     DEFINE_PROP_BOOL("port-power", USBHubState, port_power, false),
     DEFINE_PROP_UINT32("oc-port", USBHubState, oc_port, 0),
+    DEFINE_PROP_BOOL("nto64-oc-edge", USBHubState, oc_edge, true),
+    DEFINE_PROP_BOOL("nto64-oc-persistent", USBHubState, oc_persistent, false),
+    DEFINE_PROP_BOOL("nto64-oc-status", USBHubState, oc_status, true),
+    DEFINE_PROP_BOOL("nto64-oc-change", USBHubState, oc_change, true),
+    DEFINE_PROP_UINT32("nto64-oc-self-clear-reads", USBHubState,
+                       oc_self_clear_reads, 0),
 };
 
 static void usb_hub_class_initfn(ObjectClass *klass, const void *data)

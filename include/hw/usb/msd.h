@@ -62,6 +62,21 @@ struct MSDState {
      * the data phase holds the packet until the detach
      */
     bool     nto64_inflight_pending;
+    /*
+     * a READ at this LBA starts, then the device detaches mid-transfer (replug)
+     */
+    uint64_t nto64_eject_inflight_lba;
+    bool     nto64_eject_inflight_armed;
+    /*
+     * the data phase holds the packet until the detach
+     */
+    bool     nto64_inflight_pending;
+    /*
+     * the next WRITE reports WRITE PROTECTED (data phase never reaches the
+     * backend)
+     */
+    bool     nto64_wp;
+    bool     nto64_wp_armed;
     /* usb-storage only */
     BlockConf conf;
     bool removable;

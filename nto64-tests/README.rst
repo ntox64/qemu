@@ -704,3 +704,19 @@ a composite device, and over-current on a hub port.  Run
    never arrives or an interface that is present but dead.  The report
    machinery is a stub on purpose: the interesting behaviour is the
    stack's reaction to its absence.
+
+
+Hub over-current matrix
+~~~~~~~~~~~~~~~~~~~~~~~
+
+A hub can report over-current in the shapes the specification says must
+not happen: on a port it is powering, one that never clears, one that
+changes state with no status change, and a port-power budget that lies.
+Run ``make run-usboc``, ``run-usbocpersist``, ``run-usboclevel``,
+``run-usbocchange``, ``run-usbocstatus`` and ``run-usbocclear``.
+
+.. note::
+   The question each case asks is whether the driver re-reads port status
+   or trusts a cached value.  Power itself is a model: a port that
+   over-currents does not actually interrupt power delivery to a
+   co-scheduled device beyond what the hub's state machine reports.

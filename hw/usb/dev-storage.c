@@ -416,6 +416,12 @@ static void usb_msd_handle_control(USBDevice *dev, USBPacket *p,
             s->nto64_eject_armed = true;
         }
         break;
+    case VendorDeviceOutRequest | 0x58:
+        /* guest-only arm: write protect */
+        if (s->nto64_wp) {
+            s->nto64_wp_armed = true;
+        }
+        break;
     case VendorDeviceRequest | 0x59:
         /*
          * report which guest-armed hooks are
@@ -423,8 +429,19 @@ static void usb_msd_handle_control(USBDevice *dev, USBPacket *p,
          * target: the arm requests are accepted by every device, so a
          * status byte is the only reliable signal).
          */
-        data[0] = (s->nto64_eject_armed ? 0x01 : 0);
+        data[0] = (s->nto64_eject_armed ? 0x01 : 0) |
+                  (s->nto64_wp_armed ? 0x02 : 0);
         p->actual_length = MIN(length, 1);
+        break;
+    case VendorDeviceOutRequest | 0x5a:
+        /*
+         * guest-only arm for the eject DURING an
+         * in-flight transfer (the READ at the armed LBA starts, then
+         * the device detaches mid-transfer and replugs).
+         */
+        if (s->nto64_eject_inflight_lba != 0) {
+            s->nto64_eject_inflight_armed = true;
+        }
         break;
     case VendorDeviceOutRequest | 0x5a:
         /*
@@ -539,6 +556,29 @@ static void usb_msd_handle_data(USBDevice *dev, USBPacket *p)
                 usb_msd_fault_complete(s, tag, cbw.lun, cbw.cmd, cbw.cmd_len,
                                        SENSE_CODE(NO_MEDIUM), false);
                 scsi_device_set_ua(scsi_dev, SENSE_CODE(MEDIUM_CHANGED));
+                break;
+            }
+            if (s->nto64_wp_armed &&
+                (cbw.cmd[0] == 0x2a || cbw.cmd[0] == 0x8a)) {
+                s->nto64_wp_armed = false;
+                usb_msd_fault_complete(s, tag, cbw.lun, cbw.cmd, cbw.cmd_len,
+                                       SENSE_CODE(WRITE_PROTECTED), false);
+                break;
+            }
+            if (s->nto64_eject_inflight_armed && cbw.cmd[0] == 0x28 &&
+                usb_msd_cbw_lba(&cbw) == s->nto64_eject_inflight_lba) {
+                /*
+                 * eject DURING the transfer: the CBW is accepted, the
+                 * data phase begins, then the device detaches
+                 * mid-flight (the in-flight packet is held ASYNC and
+                 * the disconnect timer fires ~1 ms later), so the
+                 * transfer dies with no completion.  The replug timer
+                 * re-attaches the device and the driver re-enumerates.
+                 */
+                s->nto64_eject_inflight_armed = false;
+                s->nto64_inflight_pending = true;
+                s->data_len = le32_to_cpu(cbw.data_len);
+                s->mode = USB_MSDM_DATAIN;
                 break;
             }
             if (s->nto64_eject_inflight_armed && cbw.cmd[0] == 0x28 &&
@@ -686,6 +726,21 @@ no_fault:
                 s->nto64_stall_pending = false;
                 p->status = USB_RET_STALL;
                 break;
+            }
+            /*
+             * eject-during-in-flight - hold the
+             * data phase ASYNC and detach ~1 ms later, so the
+             * in-flight transfer is nuked by the controller with no
+             * completion event.
+             */
+            if (s->nto64_inflight_pending) {
+                s->nto64_inflight_pending = false;
+                p->status = USB_RET_ASYNC;
+                usb_packet_set_state(p, USB_PACKET_ASYNC);
+                s->packet = p;
+                timer_mod(s->disconnect_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+                return;
             }
             /*
              * eject-during-in-flight - hold the

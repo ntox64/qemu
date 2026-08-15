@@ -77,6 +77,7 @@ static const Property msd_properties[] = {
     DEFINE_PROP_UINT64("nto64-eject-lba", MSDState, nto64_eject_lba, 0),
     DEFINE_PROP_UINT64("nto64-eject-inflight-lba", MSDState,
                        nto64_eject_inflight_lba, 0),
+    DEFINE_PROP_BOOL("nto64-write-protect", MSDState, nto64_wp, false),
 };
 
 static void usb_msd_class_storage_initfn(ObjectClass *klass, const void *data)
