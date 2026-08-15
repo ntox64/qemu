@@ -35,6 +35,17 @@ struct MSDState {
     SCSIBus bus;
     /* For async completion.  */
     USBPacket *packet;
+    /* fault injection (one-shot each). */
+    /*
+     * data phase of the command at this LBA returns STALL once (endpoint halts)
+     */
+    uint64_t nto64_stall_lba;
+    bool     nto64_stall_pending;
+    /*
+     * the CSW of the command at this LBA is dropped once (never completes)
+     */
+    uint64_t nto64_drop_lba;
+    bool     nto64_drop_pending;
     /* usb-storage only */
     BlockConf conf;
     bool removable;

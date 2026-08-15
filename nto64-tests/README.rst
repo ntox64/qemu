@@ -665,3 +665,25 @@ the completion into the event ring.  Run ``make run-usbintr`` and
    A USB completion is ring state *plus* an interrupt, and losing the
    second is invisible from the first, so the case is verified by data and
    by the device-side counters rather than by counting deliveries.
+
+
+``usb-nto64`` and the storage/UAS fault slice
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A control-only full-speed device whose enumeration behaviour is
+configured per instance: ``power-ma`` (the current it declares, in 2 mA
+units), ``bad-desc``, ``no-config``, ``stall-config``, ``reset-hang``,
+``composite`` and ``kill-iface``.  Mass storage and UAS get the
+``blkdebug``-backed data-path faults in ``usb-*.conf``.
+
+Run ``make run-usbstoragetest``, ``run-usbstoragebadtrack``,
+``run-usbstorageerr``, ``run-usbstoragepersist``, ``run-usbstoragestall``,
+``run-usbstoragedrop``, ``run-uastest``, ``run-uabadtrack``,
+``run-uaerr``, ``run-uapersist``.
+
+.. note::
+   A power-budget check cannot be tested against a device that asks for
+   less than the bus provides, which is why ``power-ma`` is a property.
+   The device is full-speed and control-only: SuperSpeed bring-up,
+   isochronous endpoints and descriptor-sequence handling are separate
+   cases.

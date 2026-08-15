@@ -37,6 +37,31 @@ struct usb_msd_cbw {
     uint8_t cmd[16];
 };
 
+/* pull the LBA out of a READ/WRITE CDB (10- and 16-byte). */
+static uint64_t usb_msd_cbw_lba(const struct usb_msd_cbw *cbw)
+{
+    const uint8_t *cdb = cbw->cmd;
+    uint64_t lba = 0;
+    int i;
+
+    switch (cdb[0]) {
+    case 0x28:  /* READ(10) */
+    case 0x2a:  /* WRITE(10) */
+        lba = ((uint64_t)cdb[2] << 24) | ((uint64_t)cdb[3] << 16) |
+              ((uint64_t)cdb[4] << 8) | cdb[5];
+        break;
+    case 0x88:  /* READ(16) */
+    case 0x8a:  /* WRITE(16) */
+        for (i = 2; i < 10; i++) {
+            lba = (lba << 8) | cdb[i];
+        }
+        break;
+    default:
+        break;
+    }
+    return lba;
+}
+
 enum {
     STR_MANUFACTURER = 1,
     STR_PRODUCT,
@@ -444,6 +469,25 @@ static void usb_msd_handle_data(USBDevice *dev, USBPacket *p)
                                      cbw.cmd_len, s->data_len);
             assert(le32_to_cpu(s->csw.residue) == 0);
             s->scsi_len = 0;
+            /*
+             * arm the one-shot USB faults on LBA match.  Only
+             * READ CDBs match: the harness pre-fills the pattern with a
+             * WRITE to the same LBA, which must not consume the fault.
+             */
+            if (cbw.cmd[0] != 0x28 && cbw.cmd[0] != 0x88) {
+                goto no_fault;
+            }
+            if (s->nto64_stall_lba &&
+                usb_msd_cbw_lba(&cbw) == s->nto64_stall_lba) {
+                s->nto64_stall_lba = 0;
+                s->nto64_stall_pending = true;
+            }
+            if (s->nto64_drop_lba &&
+                usb_msd_cbw_lba(&cbw) == s->nto64_drop_lba) {
+                s->nto64_drop_lba = 0;
+                s->nto64_drop_pending = true;
+            }
+no_fault:
             s->req = scsi_req_new(scsi_dev, tag, cbw.lun, cbw.cmd, cbw.cmd_len, NULL);
             if (s->commandlog) {
                 scsi_req_print(s->req);
@@ -455,6 +499,12 @@ static void usb_msd_handle_data(USBDevice *dev, USBPacket *p)
             break;
 
         case USB_MSDM_DATAOUT:
+            /* one-shot stall of the data phase. */
+            if (s->nto64_stall_pending) {
+                s->nto64_stall_pending = false;
+                p->status = USB_RET_STALL;
+                break;
+            }
             trace_usb_msd_data_out(p->iov.size, s->data_len);
             if (p->iov.size > s->data_len) {
                 goto fail;
@@ -508,6 +558,18 @@ static void usb_msd_handle_data(USBDevice *dev, USBPacket *p)
                 goto fail;
             }
 
+            /*
+             * one-shot dropped CSW - the status read never
+             * completes, so the guest must time it out and run BOT
+             * reset recovery.
+             */
+            if (s->nto64_drop_pending) {
+                s->nto64_drop_pending = false;
+                s->packet = p;
+                p->status = USB_RET_ASYNC;
+                break;
+            }
+
             if (s->req) {
                 /* still in flight */
                 trace_usb_msd_packet_async();
@@ -520,6 +582,12 @@ static void usb_msd_handle_data(USBDevice *dev, USBPacket *p)
             break;
 
         case USB_MSDM_DATAIN:
+            /* one-shot stall of the data phase. */
+            if (s->nto64_stall_pending) {
+                s->nto64_stall_pending = false;
+                p->status = USB_RET_STALL;
+                break;
+            }
             trace_usb_msd_data_in(p->iov.size, s->data_len, s->scsi_len);
             if (s->scsi_len) {
                 usb_msd_copy_data(s, p);

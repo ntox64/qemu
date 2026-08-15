@@ -1,0 +1,308 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+
+/*
+ * usb-nto64: configurable USB device for the nto64 attach-storm /
+ * enumeration-fault harness.
+ *
+ * A minimal control-only full-speed device whose bMaxPower comes from
+ * the `power-ma` property (2 mA units), so a guest driver can exercise
+ * its power-budget check against an over-budget device (e.g.
+ * power-ma=600 on a 500 mA budget).  The fault properties model the
+ * enumeration cases a real devu-* driver must survive:
+ *   bad-desc     - the device descriptor returns garbage words
+ *   no-config    - GET_DESCRIPTOR(CONFIG) stalls
+ *   stall-config - SET_CONFIGURATION stalls
+ *   reset-hang   - the device NAKs every control request (never takes
+ *                  an address): the driver's reset/enumeration times
+ *                  out and must recover by resetting the port.
+ * adds the isochronous shape: with `nto64-isoc=on`
+ * the device presents a single vendor interface with one isoc IN
+ * endpoint (interval 1, 64-byte packets) and a bulk OUT arming
+ * endpoint.  `nto64-drop-microframe=1` + a guest-only vendor request
+ * (0x57) arms a one-shot missed service interval: the Nth isoc
+ * transfer NAKs once, so the xHCI services it at the NEXT interval
+ * and the driver sees no transfer event for one interval (the isoc
+ * stream must not wedge).
+ *
+ */
+
+#include "qemu/osdep.h"
+#include "qemu/module.h"
+#include "qemu/error-report.h"
+#include "hw/usb.h"
+#include "hw/usb/desc.h"
+#include "hw/qdev-properties.h"
+#include "qom/object.h"
+
+#define TYPE_USB_NTO64 "usb-nto64"
+OBJECT_DECLARE_SIMPLE_TYPE(Nto64UsbState, USB_NTO64)
+
+struct Nto64UsbState {
+    USBDevice dev;
+    uint32_t power_ma;
+    bool bad_desc;
+    bool no_config;
+    bool stall_config;
+    bool reset_hang;
+    /* isoc missed-microframe shape */
+    bool isoc;
+    uint32_t drop_microframe;
+    uint32_t drop_microframe_left;
+    bool drop_microframe_armed;
+    uint32_t isoc_count;
+    uint8_t isoc_buf[64];
+    uint8_t config_value;
+};
+
+enum {
+    STR_MANUFACTURER = 1,
+    STR_PRODUCT,
+};
+
+static const USBDescStrings desc_strings = {
+    [STR_MANUFACTURER] = "QEMU",
+    [STR_PRODUCT]      = "nto64 test device",
+};
+
+static const USBDescDevice desc_device_nto64 = {
+    .bcdUSB                        = 0x0100,
+    .bDeviceClass                  = 0xff,   /* vendor specific */
+    .bMaxPacketSize0               = 8,
+    .bNumConfigurations            = 1,
+    .confs = (USBDescConfig[]) {
+        {
+            .bNumInterfaces        = 0,
+            .bConfigurationValue   = 1,
+            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
+            .bMaxPower             = 50,     /* 100 mA; patched at realize */
+        },
+    },
+};
+
+static const USBDesc desc_nto64 = {
+    .id = {
+        .idVendor          = 0x1234,
+        .idProduct         = 0x1eeb,
+        .bcdDevice         = 0x0001,
+        .iManufacturer     = STR_MANUFACTURER,
+        .iProduct          = STR_PRODUCT,
+    },
+    .full = &desc_device_nto64,
+    .str  = desc_strings,
+};
+
+static void nto64_usb_handle_control(USBDevice *dev, USBPacket *p,
+                                     int request, int value, int index,
+                                     int length, uint8_t *data)
+{
+    Nto64UsbState *s = USB_NTO64(dev);
+
+    if (s->reset_hang &&
+        request != (DeviceRequest | USB_REQ_GET_STATUS)) {
+        /*
+         * the hung device never responds to enumeration: NAK so the
+         * driver's control-transfer timeout fires
+         */
+        p->status = USB_RET_NAK;
+        return;
+    }
+
+    switch (request) {
+    case DeviceOutRequest | USB_REQ_SET_ADDRESS:
+        dev->addr = value;
+        break;
+    case DeviceRequest | USB_REQ_GET_DESCRIPTOR:
+        switch (value >> 8) {
+        case USB_DT_DEVICE:
+            if (s->bad_desc) {
+                memset(data, 0xee, MIN(length, 18));
+            } else {
+                uint8_t d[18] = {
+                    18, USB_DT_DEVICE,
+                    0x00, 0x01,               /* bcdUSB 1.00 */
+                    0xff,                     /* bDeviceClass: vendor */
+                    0x00, 0x00, 0x08,         /* sub/proto, maxpacket0 */
+                    0x34, 0x12, 0xeb, 0x1e,   /* idVendor/idProduct */
+                    0x01, 0x00,               /* bcdDevice */
+                    STR_MANUFACTURER, STR_PRODUCT,
+                    0x00, 0x01,               /* iSerial, bNumConfigs */
+                };
+                memcpy(data, d, MIN(length, sizeof(d)));
+            }
+            p->actual_length = MIN(length, 18);
+            break;
+        case USB_DT_CONFIG:
+            if (s->no_config) {
+                p->status = USB_RET_STALL;
+                break;
+            } else if (s->isoc) {
+                /*
+                 * one vendor interface: isoc IN (ep 1) + bulk OUT
+                 * (ep 2, the arming/echo channel)
+                 */
+                uint8_t c[32] = {
+                    9, USB_DT_CONFIG,
+                    32, 0,                /* wTotalLength */
+                    1, 1, 0,              /* nIfaces, bConfigValue */
+                    USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
+                    (uint8_t)MIN(s->power_ma / 2, 255),
+                    9, USB_DT_INTERFACE, 0, 0, 2, 0xff, 0, 0, 0,
+                    7, USB_DT_ENDPOINT, 0x81, 1, 64, 0, 1,
+                    7, USB_DT_ENDPOINT, 0x02, 2, 64, 0, 0,
+                };
+                memcpy(data, c, MIN(length, sizeof(c)));
+                p->actual_length = MIN(length, sizeof(c));
+            } else {
+                uint8_t c[9] = {
+                    9, USB_DT_CONFIG,
+                    9, 0,                     /* wTotalLength */
+                    1, 1, 0,                  /* nIfaces, bConfigValue, iConfig */
+                    USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
+                    (uint8_t)MIN(s->power_ma / 2, 255),
+                };
+                memcpy(data, c, MIN(length, sizeof(c)));
+                p->actual_length = MIN(length, sizeof(c));
+            }
+            break;
+        default:
+            p->status = USB_RET_STALL;
+            break;
+        }
+        break;
+    case DeviceOutRequest | USB_REQ_SET_CONFIGURATION:
+        if (s->stall_config) {
+            p->status = USB_RET_STALL;
+        } else {
+            s->config_value = value & 0xff;
+        }
+        break;
+    case DeviceRequest | USB_REQ_GET_CONFIGURATION:
+        data[0] = s->config_value;
+        p->actual_length = 1;
+        break;
+    case DeviceRequest | USB_REQ_GET_STATUS:
+        data[0] = 1;                 /* self-powered */
+        data[1] = 0;
+        p->actual_length = MIN(length, 2);
+        break;
+    case VendorDeviceOutRequest | 0x57:
+        /*
+         * arm the isoc missed-microframe (guest-
+         * only; no-op on clean targets).
+         */
+        if (s->isoc && s->drop_microframe &&
+            s->drop_microframe_left > 0) {
+            s->drop_microframe_armed = true;
+        }
+        break;
+    case VendorDeviceRequest | 0x58:
+        /*
+         * report whether the drop is armed, so the
+         * harness can distinguish the clean stream (0 gaps expected)
+         * from the drop target (1 gap expected).
+         */
+        data[0] = s->drop_microframe_armed ? 1 : 0;
+        p->actual_length = MIN(length, 1);
+        break;
+    default:
+        p->status = USB_RET_STALL;
+        break;
+    }
+}
+
+static void nto64_usb_realize(USBDevice *dev, Error **errp)
+{
+    Nto64UsbState *s = USB_NTO64(dev);
+
+    usb_desc_init(dev);
+    usb_desc_attach(dev);
+    if (s->power_ma == 0 || s->power_ma > 1000) {
+        error_setg(errp, "usb-nto64: power-ma must be 1..1000");
+        return;
+    }
+    info_report("usb-nto64: attached (power %u mA, bad-desc %d, "
+                "no-config %d, stall-config %d, reset-hang %d)",
+                s->power_ma, s->bad_desc, s->no_config,
+                s->stall_config, s->reset_hang);
+    if (s->isoc) {
+        usb_ep_get(dev, USB_TOKEN_IN, 1);
+        usb_ep_get(dev, USB_TOKEN_OUT, 2);
+        s->drop_microframe_left = s->drop_microframe;
+    }
+}
+
+/* nto64_usb_handle_data: isoc stream + bulk OUT arming channel. */
+static void nto64_usb_handle_data(USBDevice *dev, USBPacket *p)
+{
+    Nto64UsbState *s = USB_NTO64(dev);
+
+    if (s->isoc) {
+        if (p->pid == USB_TOKEN_IN && p->ep->nr == 1) {
+            if (s->drop_microframe_armed) {
+                s->drop_microframe_armed = false;
+                s->drop_microframe_left--;
+                /*
+                 * missed service: complete the Nth isoc transfer
+                 * SHORT (0 bytes) - the event is generated normally
+                 * and the driver sees the anomaly without an error
+                 */
+                p->actual_length = 0;
+                return;
+            }
+            s->isoc_count++;
+            memset(s->isoc_buf, s->isoc_count & 0xff, sizeof(s->isoc_buf));
+            usb_packet_copy(p, s->isoc_buf, MIN(p->iov.size, 64));
+            p->actual_length = MIN(p->iov.size, 64);
+            return;
+        }
+        if (p->pid == USB_TOKEN_OUT && p->ep->nr == 2) {
+            /* bulk OUT echo (arming channel) */
+            usb_packet_copy(p, s->isoc_buf, MIN(p->iov.size, 64));
+            p->actual_length = MIN(p->iov.size, 64);
+            return;
+        }
+        p->status = USB_RET_STALL;
+        return;
+    }
+    p->status = USB_RET_STALL;
+}
+
+static const Property nto64_usb_properties[] = {
+    DEFINE_PROP_UINT32("power-ma", Nto64UsbState, power_ma, 100),
+    DEFINE_PROP_BOOL("bad-desc", Nto64UsbState, bad_desc, false),
+    DEFINE_PROP_BOOL("no-config", Nto64UsbState, no_config, false),
+    DEFINE_PROP_BOOL("stall-config", Nto64UsbState, stall_config, false),
+    DEFINE_PROP_BOOL("reset-hang", Nto64UsbState, reset_hang, false),
+    DEFINE_PROP_BOOL("nto64-isoc", Nto64UsbState, isoc, false),
+    DEFINE_PROP_UINT32("nto64-drop-microframe", Nto64UsbState,
+                       drop_microframe, 0),
+};
+
+static void nto64_usb_class_init(ObjectClass *klass, const void *data)
+{
+    USBDeviceClass *k = USB_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    (void)data;
+    k->realize = nto64_usb_realize;
+    k->handle_data = nto64_usb_handle_data;
+    k->handle_control = nto64_usb_handle_control;
+    k->usb_desc = &desc_nto64;
+    k->product_desc = "nto64 test device";
+    device_class_set_props(dc, nto64_usb_properties);
+    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+}
+
+static const TypeInfo nto64_usb_info = {
+    .name = TYPE_USB_NTO64,
+    .parent = TYPE_USB_DEVICE,
+    .instance_size = sizeof(Nto64UsbState),
+    .class_init = nto64_usb_class_init,
+};
+
+static void nto64_usb_register_types(void)
+{
+    type_register_static(&nto64_usb_info);
+}
+
+type_init(nto64_usb_register_types)

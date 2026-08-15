@@ -13,6 +13,11 @@
 #include "hw/usb/desc.h"
 #include "hw/usb/msd.h"
 
+static const Property bot_properties[] = {
+    DEFINE_PROP_UINT64("nto64-stall-lba", MSDState, nto64_stall_lba, 0),
+    DEFINE_PROP_UINT64("nto64-drop-lba", MSDState, nto64_drop_lba, 0),
+};
+
 static const struct SCSIBusInfo usb_msd_scsi_info_bot = {
     .tcq = false,
     .max_target = 0,
@@ -42,10 +47,12 @@ static void usb_msd_bot_realize(USBDevice *dev, Error **errp)
 
 static void usb_msd_class_bot_initfn(ObjectClass *klass, const void *data)
 {
+    DeviceClass *dc = DEVICE_CLASS(klass);
     USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
 
     uc->realize = usb_msd_bot_realize;
     uc->attached_settable = true;
+    device_class_set_props(dc, bot_properties);
 }
 
 static const TypeInfo bot_info = {

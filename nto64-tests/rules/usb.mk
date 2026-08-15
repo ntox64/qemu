@@ -24,6 +24,17 @@ run-usbintrdrop: usbintr
 	    -kernel usbintr -append 'NTO64EXP=1' \
 	    -serial stdio -display none -no-reboot
 
+USB_IMG = /tmp/usb-test.img
+# Same graph requirement as the storage steps: format on top of
+# blkdebug, and werror=report/rerror=report so backend errors reach the
+# device instead of stopping the VM.
+
+USB_DRIVE = if=none,id=drive0,format=raw,werror=report,rerror=report,file=blkdebug:$(CURDIR)/$1:$(USB_IMG)
+USB_XHCI = -device qemu-xhci,p3=0
+USB_STORAGE = -device usb-storage,drive=drive0
+UAS_DEV = -device usb-uas,id=uas
+UAS_HD = -device scsi-hd,drive=drive0,scsi-id=0,lun=0,bus=uas.0
+
 
 EXTRA_BUILT +=
 RUNTARGETS += run-usbintr run-usbintrdrop

@@ -46,6 +46,7 @@ struct USBHubState {
     USBDevice dev;
     USBEndpoint *intr;
     uint32_t num_ports;
+    uint32_t oc_port;       /* port reporting over-current (0=none) */
     bool port_power;
     QEMUTimer *port_timer;
     USBHubPort ports[MAX_PORTS];
@@ -386,6 +387,10 @@ static void usb_hub_handle_control(USBDevice *dev, USBPacket *p,
                                           port->wPortStatus,
                                           port->wPortChange);
             data[0] = port->wPortStatus;
+            if (s->oc_port == index) {
+                /* inject a port over-current event */
+                data[0] |= PORT_STAT_OVERCURRENT;
+            }
             data[1] = port->wPortStatus >> 8;
             data[2] = port->wPortChange;
             data[3] = port->wPortChange >> 8;
@@ -668,6 +673,7 @@ static const VMStateDescription vmstate_usb_hub = {
 static const Property usb_hub_properties[] = {
     DEFINE_PROP_UINT32("ports", USBHubState, num_ports, 8),
     DEFINE_PROP_BOOL("port-power", USBHubState, port_power, false),
+    DEFINE_PROP_UINT32("oc-port", USBHubState, oc_port, 0),
 };
 
 static void usb_hub_class_initfn(ObjectClass *klass, const void *data)

@@ -124,6 +124,16 @@ struct UASDevice {
 
     /* properties */
     uint32_t                  requestlog;
+    /* fault injection (one-shot each). */
+    /*
+     * COMMAND IU whose CDB LBA matches gets a RESPONSE IU (INVALID INFORMATION
+     * UNIT)
+     */
+    uint64_t                  nto64_bad_iu_lba;
+    /*
+     * drop the COMMAND IU with this tag (never answered)
+     */
+    uint16_t                  nto64_drop_tag;
 
     /* usb 2.0 only */
     USBPacket                 *status2;
@@ -700,6 +710,50 @@ static void usb_uas_command(UASDevice *uas, uas_iu *iu)
     uint16_t tag = be16_to_cpu(iu->hdr.tag);
     size_t cdb_len = sizeof(iu->command.cdb) + iu->command.add_cdb_length;
 
+    /*
+     * one-shot transport fault - respond with a RESPONSE IU
+     * (INVALID INFORMATION UNIT) instead of processing the command.
+     */
+    if (uas->nto64_bad_iu_lba) {
+        const uint8_t *cdb = iu->command.cdb;
+        uint64_t lba = 0;
+        int i;
+
+        switch (cdb[0]) {
+        case 0x28:  /* READ(10) */
+        case 0x2a:  /* WRITE(10) */
+            lba = ((uint64_t)cdb[2] << 24) | ((uint64_t)cdb[3] << 16) |
+                  ((uint64_t)cdb[4] << 8) | cdb[5];
+            break;
+        case 0x88:  /* READ(16) */
+        case 0x8a:  /* WRITE(16) */
+            for (i = 2; i < 10; i++) {
+                lba = (lba << 8) | cdb[i];
+            }
+            break;
+        default:
+            break;
+        }
+        /*
+         * Only READ CDBs match: the harness pre-fills the pattern with
+         * a WRITE to the same LBA, which must not consume the fault.
+         */
+        if ((cdb[0] == 0x28 || cdb[0] == 0x88) &&
+            lba == uas->nto64_bad_iu_lba) {
+            uas->nto64_bad_iu_lba = 0;
+            usb_uas_queue_response(uas, tag, UAS_RC_INVALID_INFO_UNIT);
+            return;
+        }
+    }
+    /*
+     * one-shot dropped COMMAND IU - never enqueued, never
+     * answered; the guest must time it out and abort it via a TMF.
+     */
+    if (uas->nto64_drop_tag && uas->nto64_drop_tag == tag) {
+        uas->nto64_drop_tag = 0;
+        return;
+    }
+
     if (iu->command.add_cdb_length > 0) {
         qemu_log_mask(LOG_UNIMP, "additional adb length not yet supported\n");
         goto unsupported_len;
@@ -953,6 +1007,8 @@ static const VMStateDescription vmstate_usb_uas = {
 
 static const Property uas_properties[] = {
     DEFINE_PROP_UINT32("log-scsi-req", UASDevice, requestlog, 0),
+    DEFINE_PROP_UINT64("nto64-bad-iu-lba", UASDevice, nto64_bad_iu_lba, 0),
+    DEFINE_PROP_UINT16("nto64-drop-tag", UASDevice, nto64_drop_tag, 0),
 };
 
 static void usb_uas_class_initfn(ObjectClass *klass, const void *data)

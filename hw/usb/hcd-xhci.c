@@ -1976,16 +1976,18 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
     while (1) {
         length = xhci_ring_chain_length(xhci, ring);
         if (length <= 0) {
-            if (epctx->type == ET_ISO_OUT || epctx->type == ET_ISO_IN) {
-                /* 4.10.3.1 */
-                XHCIEvent ev = { ER_TRANSFER };
-                ev.ccode  = epctx->type == ET_ISO_IN ?
-                    CC_RING_OVERRUN : CC_RING_UNDERRUN;
-                ev.slotid = epctx->slotid;
-                ev.epid   = epctx->epid;
-                ev.ptr    = epctx->ring.dequeue;
-                xhci_event(xhci, &ev, xhci->slots[epctx->slotid-1].intr);
-            }
+            /*
+             * 4.10.3.1: overrun/underrun is only for a PENDING
+             * isochronous transfer that was not serviced within its
+             * service interval.  This controller services every
+             * queued TRB at its interval (the kick timer fires
+             * exactly at mfindex_kick), so an empty ring here is
+             * simply "the guest has not queued the next transfer" -
+             * posting an overrun would create a spurious transfer
+             * event whose ptr (the ring dequeue) collides with the
+             * next TRB the guest queues, breaking isoc streams that
+             * submit one TRB per interval and wait for completion.
+             */
             break;
         }
         xfer = xhci_ep_alloc_xfer(epctx, length);
