@@ -47,6 +47,7 @@ struct USBHubState {
     USBEndpoint *intr;
     uint32_t num_ports;
     uint32_t oc_port;       /* port reporting over-current (0=none) */
+    bool oc_active;         /* over-current condition present */
     bool port_power;
     QEMUTimer *port_timer;
     USBHubPort ports[MAX_PORTS];
@@ -387,13 +388,18 @@ static void usb_hub_handle_control(USBDevice *dev, USBPacket *p,
                                           port->wPortStatus,
                                           port->wPortChange);
             data[0] = port->wPortStatus;
-            if (s->oc_port == index) {
-                /* inject a port over-current event */
-                data[0] |= PORT_STAT_OVERCURRENT;
-            }
             data[1] = port->wPortStatus >> 8;
             data[2] = port->wPortChange;
             data[3] = port->wPortChange >> 8;
+            if (s->oc_active && s->oc_port == index) {
+                /*
+                 * the port is in over-current: the status
+                 * bit persists and the change bit re-asserts until the
+                 * driver clears it (or power-cycles the port).
+                 */
+                data[0] |= PORT_STAT_OVERCURRENT;
+                data[2] |= PORT_STAT_C_OVERCURRENT;
+            }
             p->actual_length = 4;
         }
         break;
@@ -483,6 +489,13 @@ static void usb_hub_handle_control(USBDevice *dev, USBPacket *p,
                     usb_hub_port_clear(port, PORT_STAT_ENABLE);
                     usb_hub_port_clear(port, PORT_STAT_SUSPEND);
                     port->wPortChange = 0;
+                    /*
+                     * power-restore cycle: killing the port power ends
+                     * the over-current condition
+                     */
+                    if (s->oc_active && s->oc_port == index) {
+                        s->oc_active = false;
+                    }
                 }
                 break;
             default:
@@ -615,6 +628,9 @@ static void usb_hub_realize(USBDevice *dev, Error **errp)
     s->port_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                  usb_hub_port_update_timer, s);
     s->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
+    if (s->oc_port != 0) {
+        s->oc_active = true;
+    }
     for (i = 0; i < s->num_ports; i++) {
         port = &s->ports[i];
         usb_register_port(usb_bus_from_device(dev),

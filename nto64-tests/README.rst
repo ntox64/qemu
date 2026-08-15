@@ -687,3 +687,20 @@ Run ``make run-usbstoragetest``, ``run-usbstoragebadtrack``,
    The device is full-speed and control-only: SuperSpeed bring-up,
    isochronous endpoints and descriptor-sequence handling are separate
    cases.
+
+
+Non-disk USB misbehaviour
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+HID report faults, a stalled interrupt endpoint, a dead interface inside
+a composite device, and over-current on a hub port.  Run
+``make run-usbmisbehave``, ``run-usbbaddesc``, ``run-usbbadreport``,
+``run-usbstallintr``, ``run-usbdead``, ``run-usbenum`` and
+``run-usbpower``.
+
+.. note::
+   A HID or composite device fails differently from mass storage, and a
+   stack that only handles the storage case has never met a report that
+   never arrives or an interface that is present but dead.  The report
+   machinery is a stub on purpose: the interesting behaviour is the
+   stack's reaction to its absence.

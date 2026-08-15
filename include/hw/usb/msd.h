@@ -46,6 +46,22 @@ struct MSDState {
      */
     uint64_t nto64_drop_lba;
     bool     nto64_drop_pending;
+    /* media / power shapes (all guest-armed, one-shot). */
+    /*
+     * the next READ at this LBA reports NOT READY / MEDIUM NOT PRESENT and a
+     * media-change UA follows (re-read works)
+     */
+    uint64_t nto64_eject_lba;
+    bool     nto64_eject_armed;
+    /*
+     * a READ at this LBA starts, then the device detaches mid-transfer (replug)
+     */
+    uint64_t nto64_eject_inflight_lba;
+    bool     nto64_eject_inflight_armed;
+    /*
+     * the data phase holds the packet until the detach
+     */
+    bool     nto64_inflight_pending;
     /* usb-storage only */
     BlockConf conf;
     bool removable;

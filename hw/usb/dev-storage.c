@@ -18,6 +18,8 @@
 #include "desc.h"
 #include "hw/qdev-properties.h"
 #include "hw/scsi/scsi.h"
+#include "scsi/constants.h"
+#include "scsi/utils.h"
 #include "migration/vmstate.h"
 #include "qemu/cutils.h"
 #include "qom/object.h"
@@ -217,6 +219,35 @@ static void usb_msd_packet_complete(MSDState *s, int status)
     usb_packet_complete(&s->dev, p);
 }
 
+/*
+ * guest-armed media/power fault completion.  The command
+ * is completed at the BOT layer WITHOUT SCSI dispatch (no block I/O),
+ * so the BOT CSW carries the failure and the driver's REQUEST SENSE
+ * sees the armed sense code.  For the flush-lie shape the CSW claims
+ * success while the data is never persisted.
+ */
+static void usb_msd_fault_complete(MSDState *s, uint32_t tag, uint32_t lun,
+                                   uint8_t *cdb, size_t cdb_len,
+                                   SCSISense sense, bool good)
+{
+    SCSIDevice *scsi_dev = scsi_device_find(&s->bus, 0, 0, lun);
+
+    if (!scsi_dev || s->req) {
+        return;
+    }
+    (void)cdb;
+    (void)cdb_len;
+    s->csw.sig = cpu_to_le32(0x53425355);
+    s->csw.tag = cpu_to_le32(tag);
+    s->csw.residue = cpu_to_le32(s->data_len);
+    s->csw.status = good ? 0 : 1;
+    if (!good) {
+        /* the sense is stored on the device for REQUEST SENSE */
+        scsi_dev->sense_len = scsi_build_sense(scsi_dev->sense, sense);
+    }
+    s->mode = USB_MSDM_CSW;
+}
+
 static void usb_msd_fatal_error(MSDState *s)
 {
     trace_usb_msd_fatal_error();
@@ -379,6 +410,32 @@ static void usb_msd_handle_control(USBDevice *dev, USBPacket *p,
     }
 
     switch (request) {
+    case VendorDeviceOutRequest | 0x57:
+        /* guest-only arm: eject at the armed LBA */
+        if (s->nto64_eject_lba != 0) {
+            s->nto64_eject_armed = true;
+        }
+        break;
+    case VendorDeviceRequest | 0x59:
+        /*
+         * report which guest-armed hooks are
+         * LIVE (the harness distinguishes a clean target from a fault
+         * target: the arm requests are accepted by every device, so a
+         * status byte is the only reliable signal).
+         */
+        data[0] = (s->nto64_eject_armed ? 0x01 : 0);
+        p->actual_length = MIN(length, 1);
+        break;
+    case VendorDeviceOutRequest | 0x5a:
+        /*
+         * guest-only arm for the eject DURING an
+         * in-flight transfer (the READ at the armed LBA starts, then
+         * the device detaches mid-transfer and replugs).
+         */
+        if (s->nto64_eject_inflight_lba != 0) {
+            s->nto64_eject_inflight_armed = true;
+        }
+        break;
     case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
         break;
         /* Class specific requests.  */
@@ -470,6 +527,37 @@ static void usb_msd_handle_data(USBDevice *dev, USBPacket *p)
             assert(le32_to_cpu(s->csw.residue) == 0);
             s->scsi_len = 0;
             /*
+             * guest-armed media/power faults.  These are
+             * armed ONLY by guest vendor requests (0x57/0x58), so BIOS
+             * boot traffic can never consume them.  The fault completes
+             * the command with a synthetic sense (or a lying GOOD) and
+             * skips the real SCSI dispatch.
+             */
+            if (s->nto64_eject_armed && cbw.cmd[0] == 0x28 &&
+                usb_msd_cbw_lba(&cbw) == s->nto64_eject_lba) {
+                s->nto64_eject_armed = false;
+                usb_msd_fault_complete(s, tag, cbw.lun, cbw.cmd, cbw.cmd_len,
+                                       SENSE_CODE(NO_MEDIUM), false);
+                scsi_device_set_ua(scsi_dev, SENSE_CODE(MEDIUM_CHANGED));
+                break;
+            }
+            if (s->nto64_eject_inflight_armed && cbw.cmd[0] == 0x28 &&
+                usb_msd_cbw_lba(&cbw) == s->nto64_eject_inflight_lba) {
+                /*
+                 * eject DURING the transfer: the CBW is accepted, the
+                 * data phase begins, then the device detaches
+                 * mid-flight (the in-flight packet is held ASYNC and
+                 * the disconnect timer fires ~1 ms later), so the
+                 * transfer dies with no completion.  The replug timer
+                 * re-attaches the device and the driver re-enumerates.
+                 */
+                s->nto64_eject_inflight_armed = false;
+                s->nto64_inflight_pending = true;
+                s->data_len = le32_to_cpu(cbw.data_len);
+                s->mode = USB_MSDM_DATAIN;
+                break;
+            }
+            /*
              * arm the one-shot USB faults on LBA match.  Only
              * READ CDBs match: the harness pre-fills the pattern with a
              * WRITE to the same LBA, which must not consume the fault.
@@ -496,6 +584,17 @@ no_fault:
             if (len) {
                 scsi_req_continue(s->req);
             }
+            break;
+
+        case USB_MSDM_CSW:
+            /*
+             * after a CBW-time media/power fault the
+             * device is already in CSW mode; swallow the data the
+             * host still sends (the fault "completed" the command
+             * before the data phase) so the CSW read succeeds.
+             */
+            usb_packet_skip(p, p->iov.size);
+            p->actual_length = p->iov.size;
             break;
 
         case USB_MSDM_DATAOUT:
@@ -587,6 +686,21 @@ no_fault:
                 s->nto64_stall_pending = false;
                 p->status = USB_RET_STALL;
                 break;
+            }
+            /*
+             * eject-during-in-flight - hold the
+             * data phase ASYNC and detach ~1 ms later, so the
+             * in-flight transfer is nuked by the controller with no
+             * completion event.
+             */
+            if (s->nto64_inflight_pending) {
+                s->nto64_inflight_pending = false;
+                p->status = USB_RET_ASYNC;
+                usb_packet_set_state(p, USB_PACKET_ASYNC);
+                s->packet = p;
+                timer_mod(s->disconnect_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+                return;
             }
             trace_usb_msd_data_in(p->iov.size, s->data_len, s->scsi_len);
             if (s->scsi_len) {

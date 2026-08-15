@@ -34,6 +34,15 @@ USB_XHCI = -device qemu-xhci,p3=0
 USB_STORAGE = -device usb-storage,drive=drive0
 UAS_DEV = -device usb-uas,id=uas
 UAS_HD = -device scsi-hd,drive=drive0,scsi-id=0,lun=0,bus=uas.0
+USB_HUB = -device usb-hub,id=hub,ports=4,port-power=on,bus=xhci.0,port=1
+USB_MOUSE = -device usb-mouse,id=ms,bus=xhci.0,port=2
+USB_COMP = -device usb-nto64,id=comp,bus=xhci.0,port=1.1,power-ma=100,composite=on
+USB_NTO64 = -device usb-nto64,id=nt64,bus=xhci.0,port=1.2,power-ma=100
+USB_BADESC = -device usb-nto64,id=bd,bus=xhci.0,port=1.3,power-ma=100,bad-desc=on
+USB_NOCFG = -device usb-nto64,id=nc,bus=xhci.0,port=1.4,power-ma=100,no-config=on
+USB_RHANG = -device usb-nto64,id=rh,bus=xhci.0,port=3,power-ma=100,reset-hang=on
+USB_SCFG = -device usb-nto64,id=sc,bus=xhci.0,port=4,power-ma=100,stall-config=on
+USB_PWR = -device usb-nto64,id=pw,bus=xhci.0,port=3,power-ma=600
 
 
 EXTRA_BUILT +=

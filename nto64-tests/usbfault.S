@@ -1652,6 +1652,13 @@ run_phases:
     call phase_a4
     call phase_a5
     call phase_a6
+    /* the media/power shapes are usb-storage (BOT) hooks; UAS does
+     * not carry them, so those phases stay at their clean value */
+    cmpl $0x50, proto
+    jne 1f
+    call phase_a7
+    call phase_a11
+1:
     ret
 
 /* phase_a1: TUR + write/read round-trip on sector 0. */
@@ -1778,7 +1785,7 @@ phase_a6:
 2:  ret
 
 /* ================================================================== */
-/* SuperSpeed + isoc missed-microframe             */
+/*  media / power shapes                       */
 /* ================================================================== */
 
 /* arm_vendor: send a no-data vendor-device-out request (setup in
@@ -1796,6 +1803,248 @@ arm_vendor:
     jmp 2f
 1:  movl $1, arm_ok
 2:  ret
+
+/* get_hook_status: vendor READ (0x59) of the armed-hook status byte
+ * into hook_status (bit0 eject, bit1 write-protect, bit2 flush-lie,
+ * bit3 replug-armed).  Returns eax = cc. */
+get_hook_status:
+    movl $setup_getstatus, %ebx
+    movl $hook_status_buf, %ecx
+    movl $1, %edx
+    movl $1, %esi
+    call xhci_ctrl
+    cmpl $CC_SUCCESS, %eax
+    je 1f
+    cmpl $CC_SHORT_PACKET, %eax
+    jne 9f
+1:  movzbl hook_status_buf, %eax
+    movl %eax, hook_status
+    xorl %eax, %eax
+    ret
+9:  movl $0xffffffff, %eax
+    ret
+
+/* phase_a7: REMOVABLE-MEDIA EJECT (usb-storage nto64-eject-lba).  A
+ * guest-only vendor request arms the hook; the next READ at the armed
+ * LBA reports NOT READY / MEDIUM NOT PRESENT, the retry reports the
+ * media-change UNIT ATTENTION, and the re-read works.  The driver
+ * must bound its retries and not wedge. */
+phase_a7:
+    movl $1, a7
+    /* prefill the target LBA BEFORE arming (a write to the armed LBA
+     * would consume the eject fault) */
+    call pattern_fill
+    movl $5000, %ebx
+    call transport_write
+    cmpl $0, %eax
+    jne 9f
+    movl $setup_arm57, %ebx
+    call arm_vendor
+    call get_hook_status
+    testl %eax, %eax
+    jnz 9f
+    movl hook_status, %eax
+    andl $1, %eax
+    testl %eax, %eax
+    jz 1f                    /* hook absent: clean read expected */
+    movl $2, a7
+    movl $0, retry_cnt
+2:  incl retry_cnt
+    movl $5000, %ebx
+    call transport_read
+    testl %eax, %eax
+    jz 3f
+    /* the failed read leaves the BOT state machine mid-command
+     * (a media-change UA can complete at CBW time); run the standard
+     * BOT reset recovery so the retry starts from a clean state */
+    call bot_recover
+    movl $30, %ecx
+    call wait_ticks
+    cmpl $4, retry_cnt
+    jb 2b
+    movl $1, fail
+    ret
+3:  call verify_pattern
+    testl %eax, %eax
+    jz 4f
+    movl $1, fail
+4:  ret
+1:  movl $5000, %ebx
+    call transport_read
+    testl %eax, %eax
+    jnz 9f
+    call verify_pattern
+    testl %eax, %eax
+    jne 9f
+    ret
+9:  movl $1, fail
+    ret
+
+/* ================================================================== */
+/* eject DURING an in-flight transfer             */
+/* ================================================================== */
+
+/* wait_port_disconnected: wait up to ecx ticks for PORTSC CONNECTION
+ * to clear on port_used.  CF=0 when disconnected, CF=1 on timeout. */
+wait_port_disconnected:
+    movl ticks, %eax
+    addl %eax, %ecx
+    movl %ecx, wait_target
+1:  movl port_used, %edi
+    call portsc_read
+    testl $PORT_CCS, %eax
+    jz 8f
+    movl $1, %ecx
+    call wait_ticks
+    movl ticks, %eax
+    cmpl wait_target, %eax
+    jae 9f
+    jmp 1b
+8:  xorl %eax, %eax
+    clc
+    ret
+9:  movl $0xffffffff, %eax
+    stc
+    ret
+
+/* wait_port_connected: wait up to ecx ticks for PORTSC CONNECTION on
+ * port_used.  CF=0 when connected, CF=1 on timeout. */
+wait_port_connected:
+    movl ticks, %eax
+    addl %eax, %ecx
+    movl %ecx, wait_target
+1:  movl port_used, %edi
+    call portsc_read
+    testl $PORT_CCS, %eax
+    jnz 8f
+    movl $1, %ecx
+    call wait_ticks
+    movl ticks, %eax
+    cmpl wait_target, %eax
+    jae 9f
+    jmp 1b
+8:  xorl %eax, %eax
+    clc
+    ret
+9:  movl $0xffffffff, %eax
+    stc
+    ret
+
+/* reset_port: USB2 port reset (PR -> PRC) on port_used, clears the
+ * change bits.  CF=0 ok, CF=1 timeout. */
+reset_port:
+    movl port_used, %edi
+    movl $PORT_PR, %eax
+    call portsc_write
+    movl $500, %ecx
+1:  movl port_used, %edi
+    call portsc_read
+    testl $PORT_PRC, %eax
+    jnz 2f
+    movl $1, %ecx
+    call wait_ticks
+    decl %ecx
+    jnz 1b
+    stc
+    ret
+2:  movl $(PORT_CSC | PORT_PEC | PORT_PRC), %eax
+    call portsc_write
+    clc
+    ret
+
+/* phase_a11: eject DURING an in-flight transfer (usb-storage
+ * nto64-eject-inflight-lba, guest-armed via vendor 0x5a).  The READ
+ * at the armed LBA starts (CBW accepted, data phase held ASYNC) and
+ * the device detaches mid-transfer, so the transfer dies with no
+ * completion.  The driver bounds its read wait, settles past the
+ * deterministic replug, resets the port and full-resets the
+ * controller (HCRST clears the command/event-ring state, slots and
+ * endpoints), then re-enumerates and re-reads: the pattern survives
+ * because the backend was never touched. */
+phase_a11:
+    movl $1, a11
+    call pattern_fill
+    movl $5500, %ebx
+    call transport_write
+    cmpl $0, %eax
+    jne 9f
+    movl $setup_arm5a, %ebx
+    call arm_vendor
+    movl $5500, %ebx
+    call transport_read
+    testl %eax, %eax
+    jz 8f                    /* hook absent: the read succeeded */
+    /* the transfer died mid-flight: recover the port */
+    movl $2, a11
+    /* the detach happened ~1 ms after the data-phase hold and the
+     * replug is deterministic (nto64-replug-ms): settle past the
+     * replug instead of polling PORTSC (the port-status reads after
+     * a replug on this xhci are the flaky part), then reset the
+     * port */
+    movl storage_port, %eax
+    movl %eax, port_used
+    movl $3500, %ecx
+    call wait_ticks
+    call reset_port
+    jc 9f
+    /* zero the ring/event-ring memory: the controller state is reset
+     * below, but the ring memory still holds stale TRBs and events
+     * with old cycle bits ("zeroed ring, fresh phase") */
+    movl $cmd_ring, %edi
+    movl $RING_BYTES, %ecx
+    xorl %eax, %eax
+    rep stosb
+    movl $ep0_ring, %edi
+    movl $RING_BYTES, %ecx
+    xorl %eax, %eax
+    rep stosb
+    movl $ring_trbs, %edi
+    movl $(8 * RING_BYTES), %ecx
+    xorl %eax, %eax
+    rep stosb
+    movl $ev_ring_storage, %edi
+    movl $EV_BYTES, %ecx
+    xorl %eax, %eax
+    rep stosb
+    /* full controller re-init (HCRST): clears the command/event-ring
+     * state, slots and endpoints - the clean slate for the replugged
+     * device (avoids the stale SeaBIOS/pre-recovery command ring and
+     * the mis-matched completion events) */
+    call xhci_init
+    testl %eax, %eax
+    jnz 9f
+    call xhci_port_setup
+    testl %eax, %eax
+    jnz 9f
+    call xhci_slot_address
+    testl %eax, %eax
+    jnz 9f
+    call xhci_descriptors
+    testl %eax, %eax
+    jnz 9f
+    call xhci_configure
+    testl %eax, %eax
+    jnz 9f
+    /* re-read and verify the pattern */
+    movl $5500, %ebx
+    call transport_read
+    testl %eax, %eax
+    jnz 9f
+    call verify_pattern
+    testl %eax, %eax
+    jnz 9f
+    ret
+8:  /* hook absent (clean target): the read succeeded; verify */
+    call verify_pattern
+    testl %eax, %eax
+    jnz 9f
+    ret
+9:  movl $1, fail
+    ret
+
+/* ================================================================== */
+/* SuperSpeed + isoc missed-microframe             */
+/* ================================================================== */
 
 /* find_isoc_dev: eax = 1 if a SECOND device is present on a root port
  * other than the storage device (the isoc test device). */
@@ -2352,6 +2601,10 @@ report:
     call puts
     movl a6, %eax
     call puthex
+    movl $sp_a7, %esi
+    call puts
+    movl a7, %eax
+    call puthex
     movl $sp_a10, %esi
     call puts
     movl a10, %eax
@@ -2419,7 +2672,9 @@ a3:         .long 0
 a4:         .long 0
 a5:         .long 0
 a6:         .long 0
+a7:         .long 0
 a10:        .long 0
+a11:        .long 0
 isoc_idx:   .long 0
 isoc_gap:   .long 0
 isoc_gaps:  .long 0
@@ -2427,6 +2682,7 @@ isoc_gaps_save: .long 0
 isoc_last:  .long 0
 drop_status: .long 0
 arm_ok:     .long 0
+hook_status: .long 0
 wait_cnt:   .long 0
 cmd_last:   .long 0
 ev_ring:    .long 0
@@ -2492,6 +2748,7 @@ cdb_buf:    .space 16
 buf_data:   .space 512
 isoc_buf:   .space 64
 drop_armed_buf: .space 4
+hook_status_buf: .space 4
 
     .data
     .balign 16
@@ -2501,8 +2758,11 @@ setup_gdc:  .byte 0x80,0x06,0x00,0x02,0x00,0x00,0x00,0x00
 setup_sc:   .byte 0x00,0x09,0x01,0x00,0x00,0x00,0x00,0x00
 setup_cfh:  .byte 0x02,0x01,0x00,0x00,0x00,0x00,0x00,0x00
 setup_bmsr: .byte 0x21,0xff,0x00,0x00,0x00,0x00,0x00,0x00
-/* vendor arm for the isoc missed-microframe */
+/*  vendor arms (guest-only, no data stage) */
 setup_arm57: .byte 0x40,0x57,0x00,0x00,0x00,0x00,0x00,0x00
+setup_arm5a: .byte 0x40,0x5a,0x00,0x00,0x00,0x00,0x00,0x00
+/* vendor READ of the armed-hook status */
+setup_getstatus: .byte 0xc0,0x59,0x00,0x00,0x00,0x00,0x01,0x00
 /* vendor READ of the isoc drop-armed flag */
 setup_getdrop: .byte 0xc0,0x58,0x00,0x00,0x00,0x00,0x01,0x00
 
@@ -2530,6 +2790,8 @@ sp_a3:      .asciz " a3="
 sp_a4:      .asciz " a4="
 sp_a5:      .asciz " a5="
 sp_a6:      .asciz " a6="
+sp_a7:      .asciz " a7="
 sp_a10:     .asciz " a10="
+sp_a11:     .asciz " a11="
 sp_f:       .asciz " f="
 nl:         .asciz "\n"

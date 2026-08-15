@@ -15,6 +15,13 @@
  *   reset-hang   - the device NAKs every control request (never takes
  *                  an address): the driver's reset/enumeration times
  *                  out and must recover by resetting the port.
+ * This testbed adds the composite shape: with `nto64-composite=on`
+ * single configuration carries two vendor interfaces, each with a
+ * 64-byte bulk OUT + bulk IN echo pair (the guest writes a pattern
+ * and reads it back to prove the function is alive).  `nto64-kill-
+ * iface=N` makes interface N's endpoints STALL every transfer - the
+ * dead function a composite driver must mask while the other
+ * interface keeps working.
  * adds the isochronous shape: with `nto64-isoc=on`
  * the device presents a single vendor interface with one isoc IN
  * endpoint (interval 1, 64-byte packets) and a bulk OUT arming
@@ -44,6 +51,11 @@ struct Nto64UsbState {
     bool no_config;
     bool stall_config;
     bool reset_hang;
+    bool composite;
+    int32_t kill_iface;
+    uint8_t config_value;
+    uint8_t data_iface[2][64];
+    uint32_t io_count[2];
     /* isoc missed-microframe shape */
     bool isoc;
     uint32_t drop_microframe;
@@ -51,7 +63,6 @@ struct Nto64UsbState {
     bool drop_microframe_armed;
     uint32_t isoc_count;
     uint8_t isoc_buf[64];
-    uint8_t config_value;
 };
 
 enum {
@@ -135,33 +146,52 @@ static void nto64_usb_handle_control(USBDevice *dev, USBPacket *p,
             if (s->no_config) {
                 p->status = USB_RET_STALL;
                 break;
-            } else if (s->isoc) {
-                /*
-                 * one vendor interface: isoc IN (ep 1) + bulk OUT
-                 * (ep 2, the arming/echo channel)
-                 */
-                uint8_t c[32] = {
-                    9, USB_DT_CONFIG,
-                    32, 0,                /* wTotalLength */
-                    1, 1, 0,              /* nIfaces, bConfigValue */
-                    USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
-                    (uint8_t)MIN(s->power_ma / 2, 255),
-                    9, USB_DT_INTERFACE, 0, 0, 2, 0xff, 0, 0, 0,
-                    7, USB_DT_ENDPOINT, 0x81, 1, 64, 0, 1,
-                    7, USB_DT_ENDPOINT, 0x02, 2, 64, 0, 0,
-                };
-                memcpy(data, c, MIN(length, sizeof(c)));
-                p->actual_length = MIN(length, sizeof(c));
             } else {
-                uint8_t c[9] = {
-                    9, USB_DT_CONFIG,
-                    9, 0,                     /* wTotalLength */
-                    1, 1, 0,                  /* nIfaces, bConfigValue, iConfig */
-                    USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
-                    (uint8_t)MIN(s->power_ma / 2, 255),
-                };
-                memcpy(data, c, MIN(length, sizeof(c)));
-                p->actual_length = MIN(length, sizeof(c));
+                if (s->isoc) {
+                    /*
+                     * one vendor interface: isoc IN (ep 1) + bulk OUT
+                     * (ep 2, the arming/echo channel)
+                     */
+                    uint8_t c[32] = {
+                        9, USB_DT_CONFIG,
+                        32, 0,                /* wTotalLength */
+                        1, 1, 0,              /* nIfaces, bConfigValue */
+                        USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
+                        (uint8_t)MIN(s->power_ma / 2, 255),
+                        9, USB_DT_INTERFACE, 0, 0, 2, 0xff, 0, 0, 0,
+                        7, USB_DT_ENDPOINT, 0x81, 1, 64, 0, 1,
+                        7, USB_DT_ENDPOINT, 0x02, 2, 64, 0, 0,
+                    };
+                    memcpy(data, c, MIN(length, sizeof(c)));
+                    p->actual_length = MIN(length, sizeof(c));
+                } else if (s->composite) {
+                    /* two vendor interfaces, 64-byte bulk echo pairs */
+                    uint8_t c[55] = {
+                        9, USB_DT_CONFIG,
+                        55, 0,                /* wTotalLength */
+                        2, 1, 0,              /* nIfaces, bConfigValue, iConfig */
+                        USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
+                        (uint8_t)MIN(s->power_ma / 2, 255),
+                        9, USB_DT_INTERFACE, 0, 0, 2, 0xff, 0, 0, 0,
+                        7, USB_DT_ENDPOINT, 0x01, 2, 64, 0, 0,
+                        7, USB_DT_ENDPOINT, 0x81, 2, 64, 0, 0,
+                        9, USB_DT_INTERFACE, 1, 0, 2, 0xff, 0, 0, 0,
+                        7, USB_DT_ENDPOINT, 0x02, 2, 64, 0, 0,
+                        7, USB_DT_ENDPOINT, 0x82, 2, 64, 0, 0,
+                    };
+                    memcpy(data, c, MIN(length, sizeof(c)));
+                    p->actual_length = MIN(length, sizeof(c));
+                } else {
+                    uint8_t c[9] = {
+                        9, USB_DT_CONFIG,
+                        9, 0,                 /* wTotalLength */
+                        1, 1, 0,              /* nIfaces, bConfigValue, iConfig */
+                        USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
+                        (uint8_t)MIN(s->power_ma / 2, 255),
+                    };
+                    memcpy(data, c, MIN(length, sizeof(c)));
+                    p->actual_length = MIN(length, sizeof(c));
+                }
             }
             break;
         default:
@@ -210,31 +240,15 @@ static void nto64_usb_handle_control(USBDevice *dev, USBPacket *p,
     }
 }
 
-static void nto64_usb_realize(USBDevice *dev, Error **errp)
-{
-    Nto64UsbState *s = USB_NTO64(dev);
-
-    usb_desc_init(dev);
-    usb_desc_attach(dev);
-    if (s->power_ma == 0 || s->power_ma > 1000) {
-        error_setg(errp, "usb-nto64: power-ma must be 1..1000");
-        return;
-    }
-    info_report("usb-nto64: attached (power %u mA, bad-desc %d, "
-                "no-config %d, stall-config %d, reset-hang %d)",
-                s->power_ma, s->bad_desc, s->no_config,
-                s->stall_config, s->reset_hang);
-    if (s->isoc) {
-        usb_ep_get(dev, USB_TOKEN_IN, 1);
-        usb_ep_get(dev, USB_TOKEN_OUT, 2);
-        s->drop_microframe_left = s->drop_microframe;
-    }
-}
-
-/* nto64_usb_handle_data: isoc stream + bulk OUT arming channel. */
+/*
+ * nto64_usb_handle_data: composite bulk echo.  Each interface latches
+ * the last OUT payload and returns it on IN; a killed interface STALLs
+ * every transfer (the dead function).
+ */
 static void nto64_usb_handle_data(USBDevice *dev, USBPacket *p)
 {
     Nto64UsbState *s = USB_NTO64(dev);
+    int iface;
 
     if (s->isoc) {
         if (p->pid == USB_TOKEN_IN && p->ep->nr == 1) {
@@ -257,15 +271,60 @@ static void nto64_usb_handle_data(USBDevice *dev, USBPacket *p)
         }
         if (p->pid == USB_TOKEN_OUT && p->ep->nr == 2) {
             /* bulk OUT echo (arming channel) */
-            usb_packet_copy(p, s->isoc_buf, MIN(p->iov.size, 64));
+            usb_packet_copy(p, s->data_iface[0], MIN(p->iov.size, 64));
             p->actual_length = MIN(p->iov.size, 64);
+            s->io_count[0]++;
             return;
         }
         p->status = USB_RET_STALL;
         return;
     }
-    p->status = USB_RET_STALL;
+    if (!s->composite) {
+        p->status = USB_RET_STALL;
+        return;
+    }
+    iface = p->ep->nr - 1;
+    if (iface < 0 || iface > 1) {
+        p->status = USB_RET_STALL;
+        return;
+    }
+    if (s->kill_iface == iface) {
+        p->status = USB_RET_STALL;
+        return;
+    }
+    usb_packet_copy(p, s->data_iface[iface], MIN(p->iov.size, 64));
+    p->actual_length = MIN(p->iov.size, 64);
+    s->io_count[iface]++;
 }
+
+static void nto64_usb_realize(USBDevice *dev, Error **errp)
+{
+    Nto64UsbState *s = USB_NTO64(dev);
+
+    usb_desc_init(dev);
+    usb_desc_attach(dev);
+    if (s->power_ma == 0 || s->power_ma > 1000) {
+        error_setg(errp, "usb-nto64: power-ma must be 1..1000");
+        return;
+    }
+    info_report("usb-nto64: attached (power %u mA, bad-desc %d, "
+                "no-config %d, stall-config %d, reset-hang %d, "
+                "composite %d, kill-iface %d)",
+                s->power_ma, s->bad_desc, s->no_config,
+                s->stall_config, s->reset_hang, s->composite,
+                s->kill_iface);
+    if (s->composite) {
+        usb_ep_get(dev, USB_TOKEN_OUT, 1);
+        usb_ep_get(dev, USB_TOKEN_IN, 1);
+        usb_ep_get(dev, USB_TOKEN_OUT, 2);
+        usb_ep_get(dev, USB_TOKEN_IN, 2);
+    } else if (s->isoc) {
+        usb_ep_get(dev, USB_TOKEN_IN, 1);
+        usb_ep_get(dev, USB_TOKEN_OUT, 2);
+        s->drop_microframe_left = s->drop_microframe;
+    }
+}
+
 
 static const Property nto64_usb_properties[] = {
     DEFINE_PROP_UINT32("power-ma", Nto64UsbState, power_ma, 100),
@@ -273,6 +332,8 @@ static const Property nto64_usb_properties[] = {
     DEFINE_PROP_BOOL("no-config", Nto64UsbState, no_config, false),
     DEFINE_PROP_BOOL("stall-config", Nto64UsbState, stall_config, false),
     DEFINE_PROP_BOOL("reset-hang", Nto64UsbState, reset_hang, false),
+    DEFINE_PROP_BOOL("composite", Nto64UsbState, composite, false),
+    DEFINE_PROP_INT32("kill-iface", Nto64UsbState, kill_iface, -1),
     DEFINE_PROP_BOOL("nto64-isoc", Nto64UsbState, isoc, false),
     DEFINE_PROP_UINT32("nto64-drop-microframe", Nto64UsbState,
                        drop_microframe, 0),
@@ -285,8 +346,8 @@ static void nto64_usb_class_init(ObjectClass *klass, const void *data)
 
     (void)data;
     k->realize = nto64_usb_realize;
-    k->handle_data = nto64_usb_handle_data;
     k->handle_control = nto64_usb_handle_control;
+    k->handle_data = nto64_usb_handle_data;
     k->usb_desc = &desc_nto64;
     k->product_desc = "nto64 test device";
     device_class_set_props(dc, nto64_usb_properties);

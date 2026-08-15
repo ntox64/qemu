@@ -43,6 +43,18 @@ struct USBHIDState {
     uint32_t usb_version;
     char *display;
     uint32_t head;
+    /*
+     * HID fault hooks (guest recovers by re-reading the
+     * descriptor / resetting the endpoint and retrying).  The data
+     * faults are armed by SET_IDLE (only the guest driver sends it,
+     * so BIOS boot enumeration cannot consume them).
+     */
+    bool nto64_bad_report_desc;      /* first GET_DESCRIPTOR(REPORT) is garbage */
+    bool nto64_bad_report_desc_done;
+    bool nto64_stall_intr;           /* armed interrupt-IN report STALLs */
+    bool nto64_stall_intr_armed;
+    bool nto64_bad_report;           /* armed interrupt-IN report is truncated */
+    bool nto64_bad_report_armed;
 };
 
 #define TYPE_USB_HID "usb-hid"
@@ -578,6 +590,8 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
     USBHIDState *us = USB_HID(dev);
     HIDState *hs = &us->hid;
     int ret;
+    const uint8_t *report_desc = NULL;
+    int report_len = 0;
 
     ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
     if (ret >= 0) {
@@ -590,17 +604,23 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
         switch (value >> 8) {
         case 0x22:
             if (hs->kind == HID_MOUSE) {
-                memcpy(data, qemu_mouse_hid_report_descriptor,
-                       sizeof(qemu_mouse_hid_report_descriptor));
-                p->actual_length = sizeof(qemu_mouse_hid_report_descriptor);
+                report_desc = qemu_mouse_hid_report_descriptor;
+                report_len = sizeof(qemu_mouse_hid_report_descriptor);
             } else if (hs->kind == HID_TABLET) {
-                memcpy(data, qemu_tablet_hid_report_descriptor,
-                       sizeof(qemu_tablet_hid_report_descriptor));
-                p->actual_length = sizeof(qemu_tablet_hid_report_descriptor);
+                report_desc = qemu_tablet_hid_report_descriptor;
+                report_len = sizeof(qemu_tablet_hid_report_descriptor);
             } else if (hs->kind == HID_KEYBOARD) {
-                memcpy(data, qemu_keyboard_hid_report_descriptor,
-                       sizeof(qemu_keyboard_hid_report_descriptor));
-                p->actual_length = sizeof(qemu_keyboard_hid_report_descriptor);
+                report_desc = qemu_keyboard_hid_report_descriptor;
+                report_len = sizeof(qemu_keyboard_hid_report_descriptor);
+            }
+            if (report_desc) {
+                if (us->nto64_bad_report_desc && !us->nto64_bad_report_desc_done) {
+                    us->nto64_bad_report_desc_done = true;
+                    memset(data, 0xee, MIN(length, report_len));
+                } else {
+                    memcpy(data, report_desc, MIN(length, report_len));
+                }
+                p->actual_length = MIN(length, report_len);
             }
             break;
         default:
@@ -641,6 +661,12 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
     case HID_SET_IDLE:
         hs->idle = (uint8_t) (value >> 8);
         hid_set_next_idle(hs);
+        if (us->nto64_stall_intr) {
+            us->nto64_stall_intr_armed = true;
+        }
+        if (us->nto64_bad_report) {
+            us->nto64_bad_report_armed = true;
+        }
         if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
             hid_pointer_activate(hs);
         }
@@ -662,6 +688,11 @@ static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
     switch (p->pid) {
     case USB_TOKEN_IN:
         if (p->ep->nr == 1) {
+            if (us->nto64_stall_intr_armed) {
+                us->nto64_stall_intr_armed = false;
+                p->status = USB_RET_STALL;
+                return;
+            }
             if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
                 hid_pointer_activate(hs);
             }
@@ -674,6 +705,10 @@ static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
                 len = hid_pointer_poll(hs, buf, p->iov.size);
             } else if (hs->kind == HID_KEYBOARD) {
                 len = hid_keyboard_poll(hs, buf, p->iov.size);
+            }
+            if (us->nto64_bad_report_armed) {
+                us->nto64_bad_report_armed = false;
+                len = 1;                /* truncated report */
             }
             usb_packet_copy(p, buf, len);
         } else {
@@ -819,6 +854,12 @@ static const TypeInfo usb_tablet_info = {
 
 static const Property usb_mouse_properties[] = {
         DEFINE_PROP_UINT32("usb_version", USBHIDState, usb_version, 2),
+        DEFINE_PROP_BOOL("nto64-bad-report-desc", USBHIDState,
+                         nto64_bad_report_desc, false),
+        DEFINE_PROP_BOOL("nto64-stall-intr", USBHIDState,
+                         nto64_stall_intr, false),
+        DEFINE_PROP_BOOL("nto64-bad-report", USBHIDState,
+                         nto64_bad_report, false),
 };
 
 static void usb_mouse_class_initfn(ObjectClass *klass, const void *data)
