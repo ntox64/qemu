@@ -1548,6 +1548,38 @@ static int virtio_net_handle_mq(VirtIONet *n, uint8_t cmd,
     return VIRTIO_NET_OK;
 }
 
+/*
+ * the nto64 vendor control class - guest-only arm for the
+ * link-flap fault (the same BIOS-proof arming pattern as SET_IDLE).
+ */
+#define VIRTIO_NET_CTRL_NTO64           0x7f
+#define VIRTIO_NET_CTRL_NTO64_LINK_FLAP 0x03
+
+static virtio_net_ctrl_ack virtio_net_nto64_link_flap(VirtIONet *n)
+{
+    NetClientState *nc = qemu_get_queue(n->nic);
+
+    if (n->nto64_link_flap_ms == 0) {
+        return VIRTIO_NET_ERR;
+    }
+    nc->link_down = true;
+    virtio_net_set_link_status(nc);
+    n->nto64_link_flap_deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                  n->nto64_link_flap_ms * 1000000ULL;
+    timer_mod(n->nto64_link_timer, n->nto64_link_flap_deadline);
+    return VIRTIO_NET_OK;
+}
+
+static void virtio_net_nto64_link_up(void *opaque)
+{
+    VirtIONet *n = opaque;
+    NetClientState *nc = qemu_get_queue(n->nic);
+
+    n->nto64_link_flap_deadline = 0;
+    nc->link_down = false;
+    virtio_net_set_link_status(nc);
+}
+
 size_t virtio_net_handle_ctrl_iov(VirtIODevice *vdev,
                                   const struct iovec *in_sg, unsigned in_num,
                                   const struct iovec *out_sg,
@@ -1570,6 +1602,13 @@ size_t virtio_net_handle_ctrl_iov(VirtIODevice *vdev,
     iov_discard_front(&iov, &out_num, sizeof(ctrl));
     if (s != sizeof(ctrl)) {
         status = VIRTIO_NET_ERR;
+    } else if (n->nto64_ctrl_fail > 0 &&
+               ++n->nto64_ctrl_count == n->nto64_ctrl_fail) {
+        /*
+         * the armed control command fails once - the driver
+         * sees VIRTIO_NET_ERR and retries.
+         */
+        status = VIRTIO_NET_ERR;
     } else if (ctrl.class == VIRTIO_NET_CTRL_RX) {
         status = virtio_net_handle_rx_mode(n, ctrl.cmd, iov, out_num);
     } else if (ctrl.class == VIRTIO_NET_CTRL_MAC) {
@@ -1582,6 +1621,9 @@ size_t virtio_net_handle_ctrl_iov(VirtIODevice *vdev,
         status = virtio_net_handle_mq(n, ctrl.cmd, iov, out_num);
     } else if (ctrl.class == VIRTIO_NET_CTRL_GUEST_OFFLOADS) {
         status = virtio_net_handle_offloads(n, ctrl.cmd, iov, out_num);
+    } else if (ctrl.class == VIRTIO_NET_CTRL_NTO64 &&
+               ctrl.cmd == VIRTIO_NET_CTRL_NTO64_LINK_FLAP) {
+        status = virtio_net_nto64_link_flap(n);
     }
 
     s = iov_from_buf(in_sg, in_num, 0, &status, sizeof(status));
@@ -1934,8 +1976,21 @@ static ssize_t virtio_net_receive_rcu(NetClientState *nc, const uint8_t *buf,
         return 0;
     }
 
-    if (!receive_filter(n, buf, size))
+    if (!receive_filter(n, buf, size)) {
         return size;
+    }
+
+    if (n->nto64_rx_drop > 0 && n->nto64_rx_count < n->nto64_rx_drop) {
+        n->nto64_rx_count++;
+        if (n->nto64_rx_count == n->nto64_rx_drop) {
+            /*
+             * the armed received packet is dropped - it never
+             * reaches the RX used ring, so the driver's receive poll
+             * times out; the next packet lands normally.
+             */
+            return size;
+        }
+    }
 
     offset = i = 0;
 
@@ -2720,6 +2775,16 @@ static int32_t virtio_net_flush_tx(VirtIONetQueue *q)
     VirtQueueElement *elem;
     int32_t num_packets = 0;
     int queue_index = vq2q(virtio_get_queue_index(q->tx_vq));
+    if (n->nto64_tx_stall_active) {
+        /*
+         * the TX queue stopped consuming until a device
+         * reset (virtio_net_reset clears the flag) - the used ring
+         * never advances, so the driver's TX poll times out and it
+         * must reset the device to recover.
+         */
+        virtio_queue_set_notification(q->tx_vq, 0);
+        return num_packets;
+    }
     if (!(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
         return num_packets;
     }
@@ -2737,6 +2802,17 @@ static int32_t virtio_net_flush_tx(VirtIONetQueue *q)
 
         elem = virtqueue_pop(q->tx_vq, sizeof(VirtQueueElement));
         if (!elem) {
+            break;
+        }
+        if (n->nto64_tx_stall > 0 &&
+            ++n->nto64_tx_count == n->nto64_tx_stall) {
+            /*
+             * the armed TX packet is consumed but never
+             * completed - from here on the queue is stalled until a
+             * device reset clears it.
+             */
+            n->nto64_tx_stall_active = true;
+            virtio_queue_set_notification(q->tx_vq, 0);
             break;
         }
 
@@ -3226,6 +3302,17 @@ static int virtio_net_post_load_device(void *opaque, int version_id)
     for (i = 0; i < n->max_queue_pairs; i++) {
         qemu_get_subqueue(n->nic, i)->link_down = link_down;
     }
+    /*
+     * A link-flap fault window that was still armed when the migration
+     * started has to keep its deadline: the status bit above restores
+     * the down state on the destination, and this timer is what ends
+     * it.  The deadline is absolute virtual time, which migration
+     * carries over, so re-arming it here (even in the past - the timer
+     * then fires at once) restores the window on the destination.
+     */
+    if (n->nto64_link_flap_deadline) {
+        timer_mod(n->nto64_link_timer, n->nto64_link_flap_deadline);
+    }
 
     if (virtio_vdev_has_feature(vdev, VIRTIO_NET_F_GUEST_ANNOUNCE) &&
         virtio_vdev_has_feature(vdev, VIRTIO_NET_F_CTRL_VQ)) {
@@ -3568,6 +3655,31 @@ static const VMStateDescription vhost_user_net_backend_state = {
     }
 };
 
+/*
+ * An armed link-flap window (fault hook).  This is testbed state with no
+ * counterpart in the virtio-net wire format, so it travels as a
+ * subsection: a device that never armed a flap - every production guest
+ * and every older/newer QEMU - writes and expects exactly the fields of
+ * version 11, and the extra deadline appears only when there is one to
+ * carry.  Appending the field to the main list instead would change the
+ * layout of a released version_id for every stream, armed or not.
+ */
+static bool virtio_net_nto64_link_flap_needed(void *opaque)
+{
+    return VIRTIO_NET(opaque)->nto64_link_flap_deadline != 0;
+}
+
+static const VMStateDescription vmstate_virtio_net_nto64_link_flap = {
+    .name = "virtio-net-device/nto64-link-flap",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = virtio_net_nto64_link_flap_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(nto64_link_flap_deadline, VirtIONet),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_virtio_net_device = {
     .name = "virtio-net-device",
     .version_id = VIRTIO_NET_VM_VERSION,
@@ -3621,6 +3733,7 @@ static const VMStateDescription vmstate_virtio_net_device = {
     .subsections = (const VMStateDescription * const []) {
         &vmstate_virtio_net_rss,
         &vhost_user_net_backend_state,
+        &vmstate_virtio_net_nto64_link_flap,
         NULL
     }
 };
@@ -3995,6 +4108,8 @@ static void virtio_net_device_realize(DeviceState *dev, Error **errp)
                               object_get_typename(OBJECT(dev)), dev->id,
                               &dev->mem_reentrancy_guard, n);
     }
+    n->nto64_link_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       virtio_net_nto64_link_up, n);
 
     for (i = 0; i < n->max_queue_pairs; i++) {
         n->nic->ncs[i].do_not_pad = true;
@@ -4088,6 +4203,7 @@ static void virtio_net_device_unrealize(DeviceState *dev)
     virtio_net_rsc_cleanup(n);
     g_free(n->rss_data.indirections_table);
     net_rx_pkt_uninit(n->rx_pkt);
+    timer_free(n->nto64_link_timer);
     virtio_cleanup(vdev);
 }
 
@@ -4108,6 +4224,11 @@ static void virtio_net_reset(VirtIODevice *vdev)
     timer_del(n->announce_timer.tm);
     n->announce_timer.round = 0;
     n->status &= ~VIRTIO_NET_S_ANNOUNCE;
+    /*
+     * a device reset clears the TX stall - the driver's
+     * recovery is exactly this reset + re-init.
+     */
+    n->nto64_tx_stall_active = false;
 
     /* Flush any MAC and VLAN filter table state */
     n->mac_table.in_use = 0;
@@ -4228,6 +4349,11 @@ static const Property virtio_net_properties[] = {
     DEFINE_PROP_BIT64("ctrl_guest_offloads", VirtIONet, host_features,
                     VIRTIO_NET_F_CTRL_GUEST_OFFLOADS, true),
     DEFINE_PROP_BIT64("mq", VirtIONet, host_features, VIRTIO_NET_F_MQ, false),
+    DEFINE_PROP_UINT32("nto64-rx-drop", VirtIONet, nto64_rx_drop, 0),
+    DEFINE_PROP_UINT32("nto64-tx-stall", VirtIONet, nto64_tx_stall, 0),
+    DEFINE_PROP_UINT32("nto64-ctrl-fail", VirtIONet, nto64_ctrl_fail, 0),
+    DEFINE_PROP_UINT32("nto64-link-flap-ms", VirtIONet,
+                       nto64_link_flap_ms, 0),
     DEFINE_PROP_BIT64("rss", VirtIONet, host_features,
                     VIRTIO_NET_F_RSS, false),
     DEFINE_PROP_BIT64("hash", VirtIONet, host_features,

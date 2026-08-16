@@ -781,3 +781,52 @@ the hub and controller suspend state machines.  Run ``make run-usbsuspend``.
    controller; the case checks the device is still addressable afterwards
    rather than silently re-bound.  U1/U2 and the USB3 link states, and
    host-controller power management, are out of scope.
+
+
+Network
+-------
+
+virtio-net fault matrix
+~~~~~~~~~~~~~~~~~~~~~~~
+
+virtio-net gains controls for a received packet that is never delivered,
+a TX queue that stops consuming until the device is poked, a control
+command that fails once after being armed, and a link flap timer, plus a
+multi-queue, per-vector MSI-X configuration so steering can be tested.
+Run ``make run-netfault``, ``run-netrxdrop``, ``run-nettxstall``,
+``run-netctrlfail``, ``run-netlinkflap`` and ``run-netmsidrop``.
+
+.. note::
+   The link-flap window is guest-armed device state, not virtio wire
+   state, so it migrates as an optional subsection: a device that never
+   armed a flap (every production guest, and every older or newer QEMU)
+   writes and expects exactly the released version-11 fields, and the
+   absolute deadline appears only in a stream that has a window to carry.
+   ``post_load`` re-arms the timer from it, so a destination cannot
+   inherit a link that is down with nothing left to bring it back up.
+
+
+What this tree cannot model
+---------------------------
+
+Some limits are structural, and pretending otherwise is how a test comes
+to prove nothing.
+
+ * Homogeneity.  x86 reports one CPUID for every vCPU unless the per-CPU
+   override is used, and ARM ``virt`` enumerates one CPU type per slot, so
+   mixed-core ARM is not testable here at all.
+ * Coherency.  The interconnect is write-behind or coherent by control
+   bit; there is no snooping, ownership or partial-line state, so a cache
+   coherency bug cannot be reproduced.
+ * Timing.  Delays are host busy-waits and per-translation-block pauses:
+   relative order, not bandwidth, and never a substitute for a measurement
+   on hardware.
+ * Electrical and link behaviour.  Unplug, disconnect, over-current and
+   reset storms are register-level events with no PHY, no VBUS and no link
+   training.
+ * Firmware state.  SeaBIOS probes devices during POST and leaves them
+   configured; a driver must reset before assuming it owns a device, and a
+   test that skips that step proves nothing about the driver.
+ * Asynchronous completion.  Device transfers run from bottom halves, so
+   ordering between independent queues is the emulator's scheduling
+   rather than a property of the modelled hardware.

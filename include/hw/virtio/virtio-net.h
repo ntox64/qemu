@@ -231,6 +231,27 @@ struct VirtIONet {
     struct EBPFRSSContext ebpf_rss;
     uint32_t nr_ebpf_rss_fds;
     char **ebpf_rss_fds;
+    /* one-shot fault hooks on the stock device (default off) */
+    uint32_t nto64_rx_drop;      /* drop the Nth received packet */
+    uint32_t nto64_rx_count;
+    /*
+     * the Nth TX stalls the queue until a device reset clears it
+     */
+    uint32_t nto64_tx_stall;
+    uint32_t nto64_tx_count;
+    bool nto64_tx_stall_active;
+    uint32_t nto64_ctrl_fail;    /* the Nth control command fails once */
+    uint32_t nto64_ctrl_count;
+    uint32_t nto64_link_flap_ms; /* control-armed link down/up window */
+    QEMUTimer *nto64_link_timer;
+    /*
+     * Absolute QEMU_CLOCK_VIRTUAL deadline of the link-flap window
+     * (0 = no flap pending).  Migrated with the device: the timer
+     * itself is not, and a destination that drops the window would
+     * leave the link down (the status bit it inherited) with nothing
+     * to bring it back up.
+     */
+    uint64_t nto64_link_flap_deadline;
 };
 
 size_t virtio_net_handle_ctrl_iov(VirtIODevice *vdev,
