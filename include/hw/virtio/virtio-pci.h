@@ -164,6 +164,14 @@ struct VirtIOPCIProxy {
     VirtIOIRQFD *vector_irqfd;
     int nvqs_with_notifiers;
     VirtioBusState bus;
+    /*
+     * interrupt-loss - when armed, the
+     * Nth notify is suppressed one-shot (the used-ring entry still
+     * lands, so polling recovers; delivery resumes on the next
+     * notify).
+     */
+    uint32_t nto64_msix_drop;
+    uint32_t nto64_msix_drop_left;
 };
 
 static inline bool virtio_pci_modern(VirtIOPCIProxy *proxy)

@@ -74,6 +74,18 @@ static void virtio_pci_notify(DeviceState *d, uint16_t vector)
 {
     VirtIOPCIProxy *proxy = to_virtio_pci_proxy_fast(d);
 
+    if (msix_enabled(&proxy->pci_dev) &&
+        proxy->nto64_msix_drop_left > 0 &&
+        --proxy->nto64_msix_drop_left == 0) {
+        /*
+         * the armed interrupt is lost -
+         * no MSI-X / INTx is raised, but the used-ring entry already
+         * landed, so a driver that bounds its ISR wait and falls back
+         * to polling recovers.  One-shot: delivery resumes.
+         */
+        return;
+    }
+
     if (msix_enabled(&proxy->pci_dev)) {
         if (vector != VIRTIO_NO_VECTOR) {
             msix_notify(&proxy->pci_dev, vector);
@@ -2379,6 +2391,7 @@ static void virtio_pci_reset(DeviceState *qdev)
     int i;
 
     virtio_bus_reset(bus);
+    proxy->nto64_msix_drop_left = proxy->nto64_msix_drop;
     msix_unuse_all_vectors(&proxy->pci_dev);
 
     memset(proxy->guest_features, 0, sizeof(proxy->guest_features));
@@ -2437,6 +2450,8 @@ static void virtio_pci_bus_reset_hold(Object *obj, ResetType type)
 }
 
 static const Property virtio_pci_properties[] = {
+    DEFINE_PROP_UINT32("nto64-msix-drop", VirtIOPCIProxy,
+                       nto64_msix_drop, 0),
     DEFINE_PROP_BIT("virtio-pci-bus-master-bug-migration", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_BUS_MASTER_BUG_MIGRATION_BIT, false),
     DEFINE_PROP_BIT("modern-pio-notify", VirtIOPCIProxy, flags,
@@ -2715,4 +2730,3 @@ static void virtio_pci_register_types(void)
 }
 
 type_init(virtio_pci_register_types)
-

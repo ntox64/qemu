@@ -507,3 +507,21 @@ CPU owns and checks the assignment landed inside that window.
    placement test.  Host-bridge refusals - bus number windows, an
    above-4G prefetchable limit already programmed by firmware - are only
    partly reachable on q35.
+
+
+Storage
+-------
+
+Transport-level interrupt loss
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nto64-msix-drop=N`` on any virtio-pci device suppresses the *N*th
+notification's interrupt once: the used-ring entry still lands, delivery
+resumes on the next notification, and a device reset re-arms the counter.
+
+.. note::
+   The knob lives in the transport so every virtio device shares it
+   instead of carrying its own copy.  It is one-shot by design - a device
+   that stops interrupting forever is a different failure with a different
+   recovery.  First users are virtio-scsi (``run-scsiintr``) and
+   virtio-net (``run-netmsidrop``).
