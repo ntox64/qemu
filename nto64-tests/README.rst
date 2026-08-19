@@ -737,3 +737,20 @@ Mid-transfer disconnect and port churn
    wedging a controller that is still healthy.  A disconnect is a
    device-side event: there is no VBUS or connector timing, and the hub
    keeps its own port state rather than emulating an electrical bounce.
+
+
+Isochronous NAK re-arm and recovery without a controller reset
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An isochronous endpoint that NAKs has to be re-armed, and a device that
+reappears after a replug has to recover without ``HCRST``, which clears
+the command and event rings, the slots and the endpoints together.  Run
+``make run-usbisoc``, ``run-usbflushlie``, ``run-usbwp`` and
+``run-usbejectinflight``.
+
+.. note::
+   The difference between a driver that resets and one that recovers is
+   observable here: after the narrow recovery the prefill pattern still
+   survives, because the backend was never touched.  Isochronous transfer
+   is NAK-and-re-arm only - bandwidth scheduling, microframes and real
+   sample delivery are not modelled.

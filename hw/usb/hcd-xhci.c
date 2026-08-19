@@ -311,6 +311,7 @@ static void xhci_xfer_report(XHCITransfer *xfer);
 static void xhci_event(XHCIState *xhci, XHCIEvent *event, int v);
 static void xhci_write_event(XHCIState *xhci, XHCIEvent *event, int v);
 static USBEndpoint *xhci_epid_to_usbep(XHCIEPContext *epctx);
+static void xhci_arm_iso_nak_retry(XHCIEPContext *epctx, XHCITransfer *xfer);
 
 static const char *TRBType_names[] = {
     [TRB_RESERVED]                     = "TRB_RESERVED",
@@ -1650,6 +1651,10 @@ static int xhci_try_complete_packet(XHCITransfer *xfer)
         xfer->running_async = 0;
         xfer->running_retry = 1;
         xfer->complete = 0;
+        if (xfer->iso_xfer) {
+            /* retry at the next service interval, no guest kick */
+            xhci_arm_iso_nak_retry(xfer->epctx, xfer);
+        }
         return 0;
     } else {
         xfer->running_async = 0;
@@ -1792,6 +1797,39 @@ static void xhci_check_intr_iso_kick(XHCIState *xhci, XHCITransfer *xfer,
     }
 }
 
+/*
+ * Re-arm a NAK'd isochronous transfer for its next service interval.
+ * The xHC services an isoc endpoint every interval regardless of the
+ * guest (4.10.2.2), so a device model that NAKs an isoc transfer
+ * (e.g. no data ready) must be retried at the next interval by the
+ * controller.  Without this, the transfer sat parked in epctx->retry
+ * with no kick timer: the stream wedged until a guest doorbell, and a
+ * guest re-kick of a NAK'd isoc transfer hit the assert in
+ * xhci_kick_epctx.
+ */
+static void xhci_arm_iso_nak_retry(XHCIEPContext *epctx, XHCITransfer *xfer)
+{
+    XHCIState *xhci = epctx->xhci;
+    uint64_t mfindex = xhci_mfindex_get(xhci);
+
+    xfer->mfindex_kick = epctx->mfindex_last + epctx->interval;
+    if (xfer->mfindex_kick <= mfindex) {
+        /*
+         * the retry was already due (the NAK was processed late):
+         * roll to the next interval boundary at-or-after now
+         */
+        xfer->mfindex_kick = (mfindex + epctx->interval - 1) &
+                             ~(epctx->interval - 1);
+    }
+    xfer->timed_xfer = true;
+    xfer->running_async = false;
+    xfer->running_retry = true;
+    xfer->complete = false;
+    timer_mod(epctx->kick_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (xfer->mfindex_kick - mfindex) * 125000);
+}
+
 
 static int xhci_submit(XHCIState *xhci, XHCITransfer *xfer, XHCIEPContext *epctx)
 {
@@ -1926,8 +1964,17 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
                 return;
             }
             usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
-            assert(xfer->packet.status != USB_RET_NAK);
             xhci_try_complete_packet(xfer);
+            if (xfer->running_retry) {
+                /*
+                 * NAK'd again: the kick timer is re-armed for the
+                 * next service interval; keep the transfer parked in
+                 * epctx->retry (unmap the fresh sgl so the next
+                 * retry rebuilds it)
+                 */
+                xhci_xfer_unmap(xfer);
+                return;
+            }
         } else {
             /* retry nak'ed transfer */
             if (xhci_setup_packet(xfer) < 0) {

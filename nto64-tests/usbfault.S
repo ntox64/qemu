@@ -140,6 +140,7 @@
     .section .text
     .globl _start
 _start:
+    movl %ebx, mbi_ptr          /* save the multiboot info pointer (EBX) */
     movl $stack_top, %esp
     andl $-16, %esp
 
@@ -1653,13 +1654,16 @@ run_phases:
     call phase_a5
     call phase_a6
     /* the media/power shapes are usb-storage (BOT) hooks; UAS does
-     * not carry them, so those phases stay at their clean value */
+     * not carry them, so those phases stay at their clean value.
+     * phase_a11 runs FIRST of the BOT-specific group: on the
+     * flush-lie target it must run before the lie is armed (0x5b in
+     * phase_a9), otherwise its prefill write would be dropped too. */
     cmpl $0x50, proto
     jne 1f
+    call phase_a11
     call phase_a7
     call phase_a8
     call phase_a9
-    call phase_a11
 1:
     ret
 
@@ -1931,11 +1935,12 @@ phase_a8:
     ret
 
 /* phase_a9: FLUSH-LIE + POWER-LOSS (usb-storage nto64-flush-lie=on).
- * The guest arms the hook and the replug, writes a pattern, runs
- * SYNCHRONIZE CACHE (reports success) and then "power-loss": the
- * device detaches mid-transfer and re-attaches.  After the replug the
- * write is GONE - the driver re-enumerates and the read returns the
- * pre-write pattern, proving the flush lied. */
+ * The guest arms the hook and the replug, writes pattern A (survives),
+ * then arms the lie, writes a DIFFERENT pattern B and runs SYNCHRONIZE
+ * CACHE (reports success).  The device then "power-loss" detaches and
+ * re-attaches; the guest waits for the replug, re-enumerates and reads
+ * back.  A working flush-lie dropped pattern B, so the backend still
+ * holds pattern A; a dead hook left pattern B and the verify of A fails. */
 phase_a9:
     movl $1, a9
     /* prefill BEFORE arming, like a7 */
@@ -1944,8 +1949,8 @@ phase_a9:
     call transport_write
     cmpl $0, %eax
     jne 9f
-    /* arm flush-lie (0x57) + the replug (0x56) */
-    movl $setup_arm57, %ebx
+    /* arm flush-lie (0x5b) + the replug (0x56) */
+    movl $setup_arm5b, %ebx
     call arm_vendor
     call get_hook_status
     testl %eax, %eax
@@ -1954,7 +1959,8 @@ phase_a9:
     andl $4, %eax
     testl %eax, %eax
     jz 8f                    /* hook absent: plain write+sync, done */
-1:  call pattern_fill
+    /* the lie is live: write DIFFERENT data (mode B), then sync */
+    call pattern_fill_b
     movl $7000, %ebx
     call transport_write
     testl %eax, %eax
@@ -1972,9 +1978,12 @@ phase_a9:
     testl %eax, %eax
     jz 8f                    /* replug hook absent: clean target */
 2:  movl $2, a9
-    /* the SYNCHRONIZE CACHE lied: the write never reached the
-     * backend, so a re-read through the SAME connection returns the
-     * pre-write pattern (power-loss equivalent: the data is gone) */
+    /* wait for the detach + replug + re-enumeration, then read.  A
+     * working lie dropped mode B, so mode A returns; a dead hook left
+     * mode B and the verify of mode A fails. */
+    call phase_a9_replug
+    testl %eax, %eax
+    jnz 9f
     movl $7000, %ebx
     call transport_read
     testl %eax, %eax
@@ -1985,6 +1994,63 @@ phase_a9:
     ret
 8:  ret
 9:  movl $1, fail
+    ret
+
+/* phase_a9_replug: settle past the flush-lie power-loss replug (the
+ * device detaches ~1 ms after the 0x56 arm and re-attaches after
+ * nto64-replug-ms), reset the port, rebuild the ring state and
+ * re-enumerate on a fresh slot.  Returns eax = 0 on success, 1 on
+ * failure.  Same recovery shape as phase_a11. */
+phase_a9_replug:
+    movl storage_port, %eax
+    movl %eax, port_used
+    movl $3500, %ecx
+    call wait_ticks
+    call reset_port
+    jc .Lp9r_fail
+    /* zero the stale ring memory and rebuild the ring states */
+    movl $ep0_ring, %edi
+    movl $RING_BYTES, %ecx
+    xorl %eax, %eax
+    rep stosb
+    movl $ring_trbs, %edi
+    movl $(8 * RING_BYTES), %ecx
+    xorl %eax, %eax
+    rep stosb
+    movl $ep0_ring_state, %edi
+    movl $ep0_ring, %eax
+    call ring_init
+    movl $0, ring_idx
+.Lp9r_loop:
+    movl $rings, %eax
+    movl ring_idx, %ebx
+    imull $12, %ebx, %edx
+    addl %edx, %eax
+    movl %eax, %edi
+    movl $ring_trbs, %eax
+    movl ring_idx, %ebx
+    imull $RING_BYTES, %ebx, %edx
+    addl %edx, %eax
+    call ring_init
+    incl ring_idx
+    cmpl $8, ring_idx
+    jb .Lp9r_loop
+    call xhci_port_setup
+    testl %eax, %eax
+    jnz .Lp9r_fail
+    call xhci_slot_address
+    testl %eax, %eax
+    jnz .Lp9r_fail
+    call xhci_descriptors
+    testl %eax, %eax
+    jnz .Lp9r_fail
+    call xhci_configure
+    testl %eax, %eax
+    jnz .Lp9r_fail
+    xorl %eax, %eax
+    ret
+.Lp9r_fail:
+    movl $1, %eax
     ret
 
 /* ================================================================== */
@@ -2094,13 +2160,14 @@ phase_a11:
     call wait_ticks
     call reset_port
     jc 9f
-    /* zero the ring/event-ring memory: the controller state is reset
-     * below, but the ring memory still holds stale TRBs and events
-     * with old cycle bits ("zeroed ring, fresh phase") */
-    movl $cmd_ring, %edi
-    movl $RING_BYTES, %ecx
-    xorl %eax, %eax
-    rep stosb
+    /* natural recovery (no full controller reset): the controller's
+     * command/event-ring state and the slot table are intact - only
+     * the EP0/data ring MEMORY still holds stale TRBs with old cycle
+     * bits that would re-execute when the re-address re-points the
+     * ring dequeue at ring base with PCS=1 (the old vendor arm TRB
+     * re-arming the disconnect and cycling the device).  Zero that
+     * ring memory and rebuild the ring states, then re-enumerate on
+     * a fresh slot. */
     movl $ep0_ring, %edi
     movl $RING_BYTES, %ecx
     xorl %eax, %eax
@@ -2109,17 +2176,23 @@ phase_a11:
     movl $(8 * RING_BYTES), %ecx
     xorl %eax, %eax
     rep stosb
-    movl $ev_ring_storage, %edi
-    movl $EV_BYTES, %ecx
-    xorl %eax, %eax
-    rep stosb
-    /* full controller re-init (HCRST): clears the command/event-ring
-     * state, slots and endpoints - the clean slate for the replugged
-     * device (avoids the stale SeaBIOS/pre-recovery command ring and
-     * the mis-matched completion events) */
-    call xhci_init
-    testl %eax, %eax
-    jnz 9f
+    movl $ep0_ring_state, %edi
+    movl $ep0_ring, %eax
+    call ring_init
+    movl $0, ring_idx
+1:  movl $rings, %eax
+    movl ring_idx, %ebx
+    imull $12, %ebx, %edx
+    addl %edx, %eax
+    movl %eax, %edi
+    movl $ring_trbs, %eax
+    movl ring_idx, %ebx
+    imull $RING_BYTES, %ebx, %edx
+    addl %edx, %eax
+    call ring_init
+    incl ring_idx
+    cmpl $8, ring_idx
+    jb 1b
     call xhci_port_setup
     testl %eax, %eax
     jnz 9f
@@ -2239,12 +2312,12 @@ get_drop_status:
 /* phase_a10: isoc stream + missed-microframe recovery.  Eight isoc IN
  * transfers at 1 ms intervals; the controller services one per
  * interval.  On the drop target (nto64-drop-microframe=1 + vendor
- * 0x57 arm) the armed isoc IN completes SHORT with 0 bytes (the
- * device models the missed service interval as an empty packet), so
- * the driver sees the anomaly as a 0-length completion and must keep
- * the stream going.  The phase counts 0-length completions and fails
- * unless the count matches what the drop-armed status promised
- * (exactly 1 on the drop target, 0 on a clean stream). */
+ * 0x57 arm) the armed isoc IN is NAK'd once by the device; the xHCI
+ * must re-arm the retry for the NEXT service interval, so the
+ * transfer completes full-length one interval late and the stream
+ * must not wedge.  The phase submits all 8 transfers (a timeout on
+ * the armed one = the NAK-retry is missing) and fails on any
+ * 0-length completion; EVG reports the armed-drop expectation. */
 phase_a10:
     movl $1, a10
     /* if the current device is already the isoc device (slot 1,
@@ -2336,29 +2409,33 @@ phase_a10:
     movl isoc_dci, %edi
     call xhci_tx_isoc
     cmpl $0xffffffff, %eax
-    je 8f
+    je 7f                    /* timeout: the NAK'd transfer wedged */
     cmpl $CC_SUCCESS, %eax
     je 3f
     cmpl $CC_SHORT_PACKET, %eax
     jne 8f
 3:  /* the event length is the RESIDUAL (TRB length - transferred):
-     * a full 64-byte completion reports 0, the missed microframe (0
-     * bytes transferred) reports the full TRB length */
+     * a full 64-byte completion reports 0.  The armed isoc transfer
+     * is NAK'd once by the device and retried by the xHCI at the
+     * NEXT service interval, so it completes full-length one
+     * interval late; only a true 0-byte completion would report the
+     * full TRB length. */
     testl %edx, %edx
     jz 5f
     incl isoc_gaps
 5:  incl isoc_idx
     cmpl $8, isoc_idx
     jb 10b
-    /* assert the drop was observed exactly as armed */
+    /* all 8 transfers completed: the armed NAK (isoc_gaps_save = 1
+     * on the drop target) was absorbed by the xHCI's next-interval
+     * retry - no short completion, no wedge */
     movl isoc_gaps, %eax
-    cmpl isoc_gaps_save, %eax
-    je 6f
-    movl $1, fail
-    ret
-6:
+    testl %eax, %eax
+    jnz 7f
     movl $2, a10
 8:  ret
+7:  movl $1, fail
+    ret
 
 /* transport dispatch: read/write/tur/sync via BOT or UAS */
 transport_write:
@@ -2553,6 +2630,19 @@ pattern_fill:
     decl %ecx
     jnz 1b
     ret
+/* pattern_fill_b: the NOT-baseline pattern (mode B).  The flush-lie
+ * phase writes mode A before arming the fault, then mode B after, so a
+ * post-replug readback distinguishes a write the backend kept (mode B)
+ * from one the flush lie dropped (mode A). */
+pattern_fill_b:
+    movl $buf_data, %edi
+    movl $128, %ecx
+    movl $0x11223344, %eax
+1:  movl %eax, (%edi)
+    addl $4, %edi
+    decl %ecx
+    jnz 1b
+    ret
 pattern_read_lba1000:
     movl $1000, %ebx
     call transport_read
@@ -2679,7 +2769,46 @@ irq_stub:
     popal
     iret
 
+/* nto64_expect + hex helper come from the shared include. */
+.set NTO64_NEEDS_SEQ, 1
+.set NTO64_EXPECT_COUNT, 12
+.include "nto64-expect.inc"
+
+/* verify_expect: compare each phase to the expected-value string (one
+ * hex digit per phase, in report order: a1..a11, then EVG).  A dead
+ * fault hook leaves a phase at its clean value, which then mismatches,
+ * so a fault run cannot silently pass. */
+.macro CHECK_EXPECT off, var
+    movl expect+\off, %eax
+    cmpl %eax, \var
+    je .Lve_ok_\off
+    incl fail
+.Lve_ok_\off:
+.endm
+
+verify_expect:
+    call nto64_expect_seq
+    cmpl $NTO64_EXPECT_COUNT, %eax
+    jne .Lve_noexpect
+    CHECK_EXPECT 0, a1
+    CHECK_EXPECT 4, a2
+    CHECK_EXPECT 8, a3
+    CHECK_EXPECT 12, a4
+    CHECK_EXPECT 16, a5
+    CHECK_EXPECT 20, a6
+    CHECK_EXPECT 24, a7
+    CHECK_EXPECT 28, a8
+    CHECK_EXPECT 32, a9
+    CHECK_EXPECT 36, a10
+    CHECK_EXPECT 40, a11
+    CHECK_EXPECT 44, isoc_gaps_save
+    ret
+.Lve_noexpect:
+    incl fail
+    ret
+
 report:
+    call verify_expect
     movl $msg, %esi
     call puts
     movl proto, %eax
@@ -2730,7 +2859,11 @@ report:
     call puthex
     movl $msg_evg, %esi
     call puts
-    movl isoc_gaps, %eax
+    /* EVG = the armed missed-microframe expectation (1 on the drop
+     * target): the NAK is absorbed by the xHCI next-interval retry,
+     * so the run report still discriminates the drop target from a
+     * clean stream (isoc_gaps, the 0-length completions, must be 0) */
+    movl isoc_gaps_save, %eax
     call puthex
     movl $sp_f, %esi
     call puts
@@ -2785,6 +2918,8 @@ wait_target:.long 0
 ev_deadline:.long 0
 tx_dci:     .long 0
 fail:       .long 0
+mbi_ptr:    .long 0
+expect:     .space 64
 a1:         .long 0
 a2:         .long 0
 a3:         .long 0
@@ -2884,6 +3019,7 @@ setup_arm56: .byte 0x40,0x56,0x00,0x00,0x00,0x00,0x00,0x00
 setup_arm57: .byte 0x40,0x57,0x00,0x00,0x00,0x00,0x00,0x00
 setup_arm58: .byte 0x40,0x58,0x00,0x00,0x00,0x00,0x00,0x00
 setup_arm5a: .byte 0x40,0x5a,0x00,0x00,0x00,0x00,0x00,0x00
+setup_arm5b: .byte 0x40,0x5b,0x00,0x00,0x00,0x00,0x00,0x00
 /* vendor READ of the armed-hook status */
 setup_getstatus: .byte 0xc0,0x59,0x00,0x00,0x00,0x00,0x01,0x00
 /* vendor READ of the isoc drop-armed flag */

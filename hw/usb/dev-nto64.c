@@ -325,11 +325,12 @@ static void nto64_usb_handle_data(USBDevice *dev, USBPacket *p)
                 s->drop_microframe_armed = false;
                 s->drop_microframe_left--;
                 /*
-                 * missed service: complete the Nth isoc transfer
-                 * SHORT (0 bytes) - the event is generated normally
-                 * and the driver sees the anomaly without an error
+                 * missed service: NAK the Nth isoc transfer once.
+                 * The xHCI re-arms the retry for the next service
+                 * interval, so the transfer completes one interval
+                 * late with full data and the stream must not wedge.
                  */
-                p->actual_length = 0;
+                p->status = USB_RET_NAK;
                 return;
             }
             s->isoc_count++;

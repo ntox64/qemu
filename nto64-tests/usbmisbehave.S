@@ -2573,31 +2573,25 @@ phase_a9:
     call a4_oc_present
     testl %edx, %edx
     jnz fail_phase
-    /* re-enumerate the composite after the power cycle.  A FULL
-     * controller reset (HCRST) first, with the ring MEMORY zeroed:
-     * after the composite's detach/replug this xhci re-executes the
-     * stale EP0 ring (the old 0x56 arm TRB re-arms the disconnect
-     * after every replug, cycling the device) - ring_init alone is
-     * not enough, the stale TRB survives in the ring memory
-     * ("zeroed ring, fresh phase").  Then bring the composite up
-     * fresh and prove the echo. */
-    movl $cmd_ring, %edi
-    movl $RING_BYTES, %ecx
-    xorl %eax, %eax
-    rep stosb
-    movl $dev_rings, %edi
-    movl $(ND * 5 * RING_BYTES), %ecx
-    xorl %eax, %eax
-    rep stosb
-    movl $ev_ring_storage, %edi
-    movl $EV_BYTES, %ecx
-    xorl %eax, %eax
-    rep stosb
-    call xhci_init
-    testl %eax, %eax
-    jnz fail_phase
-    /* the composite's pending replug timer (from the last cycle) may
-     * still fire after the reset: wait for it to be attached */
+    /* re-enumerate the composite after the power cycle with NO full
+     * controller reset.  The controller state (command/event rings)
+     * is intact; the composite never actually detached at the xHC
+     * (the hub power cycle only clears the port bits), so its old
+     * slot still owns the port - tear that slot down first.  Then
+     * recycle the composite's ring MEMORY: stale TRBs with old cycle
+     * bits would re-execute when the fresh slot's EP0/data dequeue
+     * re-points at ring base with PCS=1 (the old 0x56 arm TRB re-
+     * arms the disconnect and cycles the device) - ring_init alone
+     * is not enough, the stale TRB survives in the ring memory.
+     * Zero ONLY the composite's rings and rebuild their states. */
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call dev_disable
+    movl cur_dev, %eax
+    call dev_rings_recycle
+2:  /* wait for the hub port to show the composite connected again */
     movl hub_dev, %eax
     movl %eax, cur_dev
     movl $4000, %ecx

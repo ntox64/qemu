@@ -47,6 +47,162 @@ USB_DISC = -device usb-nto64,id=comp,bus=xhci.0,port=1.1,power-ma=100,composite=
 USB_STORM = -device usb-hub,id=hub,ports=4,port-power=on,nto64-port-storm=on,nto64-storm-port=1,nto64-storm-flaps=4,nto64-storm-period-ms=50,bus=xhci.0,port=1
 NET_DEV = -device virtio-net-pci,netdev=n0,ioeventfd=off
 
+usbfault: usbfault.S
+	# --build-id=none: see the numatest comment (multiboot span trap).
+	gcc -m32 -nostdlib -static -fno-pie \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext=0x101000 -Wl,--section-start=.multiboot=0x100000 \
+	    -o $@ $<
+
+USB_KERNEL = -kernel usbfault -append '$(USB_EXP)' -serial stdio -display none -no-reboot
+
+run-usbstoragetest: USB_EXP = 113111111010
+run-usbstoragebadtrack: USB_EXP = 123111111010
+run-usbstorageerr: USB_EXP = 116111111010
+run-usbstoragepersist: USB_EXP = 113211111010
+run-usbstoragestall: USB_EXP = 113121111010
+run-usbstoragedrop: USB_EXP = 113112111010
+run-usbss: USB_EXP = 113111111010
+run-usbisoc: USB_EXP = 000000000201
+run-usbeject: USB_EXP = 113111211010
+run-usbejectinflight: USB_EXP = 113111111020
+run-usbwp: USB_EXP = 113111121010
+run-usbflushlie: USB_EXP = 113111112010
+run-uastest: USB_EXP = 113111000000
+run-uabadtrack: USB_EXP = 123111000000
+run-uaerr: USB_EXP = 116111000000
+run-uapersist: USB_EXP = 113211000000
+run-uabad: USB_EXP = 113121000000
+run-uadrop: USB_EXP = 113112000000
+
+run-usbstoragetest: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    $(USB_XHCI) $(USB_STORAGE) \
+	    $(USB_KERNEL)
+
+run-usbstoragebadtrack: usbfault usb-badtrack.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-badtrack.conf) \
+	    $(USB_XHCI) $(USB_STORAGE) \
+	    $(USB_KERNEL)
+
+run-usbstorageerr: usbfault usb-err.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-err.conf) \
+	    $(USB_XHCI) $(USB_STORAGE) \
+	    $(USB_KERNEL)
+
+run-usbstoragepersist: usbfault usb-persist.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-persist.conf) \
+	    $(USB_XHCI) $(USB_STORAGE) \
+	    $(USB_KERNEL)
+
+run-usbstoragestall: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    $(USB_XHCI) -device usb-storage,drive=drive0,nto64-stall-lba=8000 \
+	    $(USB_KERNEL)
+
+run-usbstoragedrop: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    $(USB_XHCI) -device usb-storage,drive=drive0,nto64-drop-lba=7500 \
+	    $(USB_KERNEL)
+
+run-usbss: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    -device qemu-xhci,p3=2 $(USB_STORAGE) \
+	    $(USB_KERNEL)
+
+run-usbisoc: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -device qemu-xhci,p3=0,id=xhci \
+	    -device usb-nto64,id=isocd,bus=xhci.0,port=1,power-ma=100,nto64-isoc=on,nto64-drop-microframe=1 \
+	    $(USB_KERNEL)
+
+run-usbeject: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    $(USB_XHCI) -device usb-storage,drive=drive0,nto64-eject-lba=5000 \
+	    $(USB_KERNEL)
+
+run-usbejectinflight: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    $(USB_XHCI) -device usb-storage,drive=drive0,nto64-eject-inflight-lba=5500 \
+	    $(USB_KERNEL)
+
+run-usbwp: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    $(USB_XHCI) -device usb-storage,drive=drive0,nto64-write-protect=on \
+	    $(USB_KERNEL)
+
+run-usbflushlie: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    $(USB_XHCI) -device usb-storage,drive=drive0,nto64-flush-lie=on \
+	    $(USB_KERNEL)
+
+run-uastest: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    $(USB_XHCI) $(UAS_DEV) $(UAS_HD) \
+	    $(USB_KERNEL)
+
+run-uabadtrack: usbfault usb-badtrack.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-badtrack.conf) \
+	    $(USB_XHCI) $(UAS_DEV) $(UAS_HD) \
+	    $(USB_KERNEL)
+
+run-uaerr: usbfault usb-err.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-err.conf) \
+	    $(USB_XHCI) $(UAS_DEV) $(UAS_HD) \
+	    $(USB_KERNEL)
+
+run-uapersist: usbfault usb-persist.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-persist.conf) \
+	    $(USB_XHCI) $(UAS_DEV) $(UAS_HD) \
+	    $(USB_KERNEL)
+
+run-uabad: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    $(USB_XHCI) -device usb-uas,id=uas,nto64-bad-iu-lba=8000 \
+	    $(UAS_HD) \
+	    $(USB_KERNEL)
+
+run-uadrop: usbfault usb-clean.conf
+	truncate -s 4M $(USB_IMG)
+	$(QEMU) -machine pc -m 64 \
+	    -drive $(call USB_DRIVE,usb-clean.conf) \
+	    $(USB_XHCI) -device usb-uas,id=uas,nto64-drop-tag=4660 \
+	    $(UAS_HD) \
+	    $(USB_KERNEL)
+
 
 EXTRA_BUILT +=
-RUNTARGETS += run-usbintr run-usbintrdrop
+RUNTARGETS += run-uabad run-uabadtrack run-uadrop run-uaerr run-uapersist run-uastest run-usbeject run-usbejectinflight run-usbflushlie run-usbintr run-usbintrdrop run-usbisoc run-usbss run-usbstoragebadtrack run-usbstoragedrop run-usbstorageerr run-usbstoragepersist run-usbstoragestall run-usbstoragetest run-usbwp
