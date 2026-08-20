@@ -56,6 +56,15 @@
  *        the driver bounds its wait, re-enumerates after the storm
  *        settles (recycling the composite's transfer rings under the
  *        new slot) and verifies the composite echo.
+ *   a10 - hub-port RESET storm: a guest-only vendor request
+ *        (0x58) to the hub starts nto64-reset-storm - the downstream
+ *        port NEVER disconnects, but the hub keeps re-signaling PORT
+ *        RESET (the C_RESET change bit re-asserts and the child is
+ *        reset, losing its address/config) storm-flaps times.  The
+ *        driver must NOT treat a reset as a disconnect: it bounds its
+ *        wait for the first C_RESET, settles past the storm
+ *        (stability window), then re-enumerates on recycled rings and
+ *        verifies the echo.
  *
  * Verified target matrix (run-* targets, all f=0):
  *   run-usbmisbehave:  a1=4 a2=1 a3=1 a4=1 a5=1 a6=0 (clean)
@@ -63,6 +72,8 @@
  *                      port reset -> re-enumerate -> clean parse)
  *   run-usbstallintr:  a1=4 a3=2 (stall -> Reset Endpoint +
  *                      CLEAR_FEATURE -> retry ok)
+ *   run-usbresetstorm: a1=4 a10=2 (reset storm -> settle ->
+ *                      re-enumerate -> echo ok)
  *   run-usbbadreport:  a1=4 a3=2 (truncated report -> same recovery)
  *   run-usboc:         a1=4 a4=2 (OC -> power cycle -> re-enumerate)
  *   run-usbocpersist:  a1=4 a4=2 (OC survives power cycles -> bounded
@@ -81,9 +92,10 @@
  *                      rejected, healthy devices all up)
  *   run-usbpower:      a1=4 a6=1 (over-budget device rejected)
  *   Every target also runs thephases in their clean shape
- *   (a7=1 a8=1); run-usbdisconnect additionally expects a7=2 (the
- *   mid-transfer disconnect -> teardown -> replug -> re-enumerate)
- *   and run-usbstorm a8=2 (storm -> settle -> re-enumerate).
+ *   (a7=1 a8=1 a10=1); run-usbdisconnect additionally expects a7=2
+ *   (the mid-transfer disconnect -> teardown -> replug -> re-enumerate),
+ *   run-usbstorm a8=2 (storm -> settle -> re-enumerate) and
+ *   run-usbresetstorm a10=2 (reset storm -> settle -> re-enumerate).
  * The HID data faults are armed by SET_IDLE (only the guest driver
  * sends it), so BIOS boot enumeration cannot consume them.
  * The over-current fault is armed by the hub's SET_CONFIGURATION for
@@ -132,6 +144,7 @@
 
 #define PORT_CCS        0x01
 #define PORT_PED        0x02
+#define PORT_CCR        0x10
 #define PORT_PR         0x10
 #define PORT_PP         0x200
 #define PORT_SPEED_MASK 0x3c00
@@ -224,6 +237,7 @@
 #define PORT_FEAT_RESET         4
 #define PORT_FEAT_POWER         8
 #define PORT_FEAT_C_OVERCURRENT 19
+#define PORT_FEAT_C_RESET       20
 
 /* xHCI endpoint types */
 #define EP_BULK_OUT     2
@@ -327,6 +341,7 @@ found_xhci:
     call phase_a7
     call phase_a8
     call phase_a9
+    call phase_a10
     call report
     jmp halt
 
@@ -1659,7 +1674,8 @@ portsc_write:
     ret
 
 /* hub helpers: current device is the hub. */
-/* hub_get_port_status: esi = port.  Returns wPortStatus in eax. */
+/* hub_get_port_status: esi = port.  Returns wPortStatus in eax and
+ * wPortChange in edx. */
 hub_get_port_status:
     movw %si, setup_gps+4
     movl $hub_status_buf, %ecx
@@ -1668,6 +1684,7 @@ hub_get_port_status:
     movl $setup_gps, %ebx
     call xhci_ctrl
     movzwl hub_status_buf, %eax
+    movzwl hub_status_buf+2, %edx
     ret
 /* hub_set_feature: ebx = feature, esi = port */
 hub_set_feature:
@@ -2616,6 +2633,74 @@ phase_a9:
     ret
 9:  ret
 
+/* phase_a10: hub-port RESET storm.  A guest-only vendor
+ * request (0x58) to the hub starts nto64-reset-storm: the downstream
+ * port NEVER disconnects, but the hub keeps re-signaling PORT RESET
+ * (the C_RESET change bit re-asserts, the child is reset and loses
+ * its address/config) storm-flaps times.  The driver must not treat a
+ * reset as a disconnect: it bounds its wait for the first C_RESET,
+ * clears it, settles past the storm (C_RESET clear + stability
+ * window), then re-enumerates the composite and verifies the echo. */
+phase_a10:
+    movl $1, a10
+    movl $KIND_HUB, %ebx
+    call find_kind
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, hub_dev
+    movl %eax, cur_dev
+    /* drain a C_RESET left by an earlier bring-up port reset so the
+     * storm observation below is unambiguous */
+    movl $PORT_FEAT_C_RESET, %ebx
+    movl $1, %esi
+    call hub_clear_feature
+    /* arm the reset storm (vendor 0x58 to the hub) */
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    xorl %esi, %esi
+    movl $setup_arm58, %ebx
+    call xhci_ctrl
+    cmpl $CC_SUCCESS, %eax
+    je 1f
+    cmpl $CC_SHORT_PACKET, %eax
+    jne fail_phase
+1:  /* wait for the first C_RESET on the composite's hub port (1) */
+    movl $1, hub_port
+    movl $2000, %ecx
+    call wait_hub_port_reset
+    jc 9f                 /* no storm: clean target, a10 stays 1 */
+    movl $2, a10
+    /* clear the re-asserted change bit (bounded) until a quiet
+     * window proves the storm has stopped */
+    movl $5000, %ecx
+    call wait_hub_port_reset_storm_end
+    jc fail_phase
+    /* re-enumerate the composite on its hub port (the resets cleared
+     * its address/config, but it never disconnected) */
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call dev_disable
+    /* a reset storm leaves the rings of a device that never detached
+     * fully populated with its old, already-completed TRBs; the new
+     * slot would replay them from ring base.  Recycle them first, as
+     * the port-storm and disconnect recoveries do. */
+    movl cur_dev, %eax
+    call dev_rings_recycle
+    call devptr
+    movl %eax, %ecx
+    movl $1, DEV_PORT(%ecx)
+    movl $1, DEV_ROUTE(%ecx)
+    movl $1, DEV_SPEED(%ecx)
+    call bringup
+    testl %eax, %eax
+    jnz fail_phase
+    call comp_verify_a
+    testl %eax, %eax
+    jnz fail_phase
+9:  ret
+
 /* wait_oc_present: wait up to ecx ticks for the OC status/change
  * bits on oc_port_cur (cur_dev must be the hub).  CF=0 + edx=bits
  * when present, CF=1 on timeout. */
@@ -2731,6 +2816,66 @@ wait_hub_port_settled:
     jae 8f
     jmp 3f
 2:  movl $0, oc_clears
+3:  movl $1, %ecx
+    call wait_ticks
+    movl ticks, %eax
+    cmpl hub_wait_deadline, %eax
+    jae 9f
+    jmp 1b
+8:  xorl %eax, %eax
+    clc
+    ret
+9:  movl $0xffffffff, %eax
+    stc
+    ret
+
+/* wait_hub_port_reset: poll the hub's downstream port (cur_dev =
+ * hub, hub_port = port) until the C_RESET change bit is SET.  ecx =
+ * bound ticks; carry on timeout. */
+wait_hub_port_reset:
+    movl ticks, %eax
+    addl %eax, %ecx
+    movl %ecx, hub_wait_deadline
+1:  movl hub_port, %esi
+    call hub_get_port_status
+    testl $PORT_CCR, %edx
+    jnz 8f
+    movl $1, %ecx
+    call wait_ticks
+    movl ticks, %eax
+    cmpl hub_wait_deadline, %eax
+    jae 9f
+    jmp 1b
+8:  xorl %eax, %eax
+    clc
+    ret
+9:  movl $0xffffffff, %eax
+    stc
+    ret
+
+/* wait_hub_port_reset_storm_end: the storm has been observed - clear
+ * the C_RESET change bit whenever it re-asserts (bounded, no spin)
+ * and declare the storm over after a 300-tick quiet window.  ecx =
+ * bound ticks; carry on timeout. */
+wait_hub_port_reset_storm_end:
+    movl ticks, %eax
+    addl %eax, %ecx
+    movl %ecx, hub_wait_deadline
+    movl $0, oc_clears
+1:  movl hub_port, %esi
+    call hub_get_port_status
+    testl $PORT_CCR, %edx
+    jz 2f
+    /* still storming: clear the re-asserted change bit once and
+     * restart the quiet window */
+    movl $PORT_FEAT_C_RESET, %ebx
+    movl hub_port, %esi
+    call hub_clear_feature
+    movl $0, oc_clears
+    jmp 3f
+2:  incl oc_clears
+    cmpl $300, oc_clears
+    jae 8f
 3:  movl $1, %ecx
     call wait_ticks
     movl ticks, %eax
@@ -2886,6 +3031,10 @@ report:
     call puts
     movl a9, %eax
     call puthex
+    movl $sp_a10, %esi
+    call puts
+    movl a10, %eax
+    call puthex
     movl $sp_f, %esi
     call puts
     movl fail, %eax
@@ -2937,6 +3086,7 @@ a6:         .long 0
 a7:         .long 0
 a8:         .long 0
 a9:         .long 0
+a10:        .long 0
 verify_attempts: .long 0
 tx_bound:   .space 4
 hub_wait_deadline: .space 4
@@ -3012,6 +3162,9 @@ setup_arm56:.byte 0x40,0x56,0x00,0x00,0x00,0x00,0x00,0x00
 /* vendor arm for the hub OC-mid (usb-hub
  * nto64-oc-mid-transfer) - bRequest 0x57. */
 setup_arm57:.byte 0x40,0x57,0x00,0x00,0x00,0x00,0x00,0x00
+/* vendor arm for the hub-port RESET storm (usb-hub
+ * nto64-reset-storm) - bRequest 0x58. */
+setup_arm58:.byte 0x40,0x58,0x00,0x00,0x00,0x00,0x00,0x00
 pattern_a:  .fill 16, 4, 0x11111111
 pattern_b:  .fill 16, 4, 0x22222222
 
@@ -3036,5 +3189,6 @@ sp_a6:      .asciz " a6="
 sp_a7:      .asciz " a7="
 sp_a8:      .asciz " a8="
 sp_a9:      .asciz " a9="
+sp_a10:     .asciz " a10="
 sp_f:       .asciz " f="
 nl:         .asciz "\n"

@@ -65,6 +65,16 @@ struct USBHubState {
     uint32_t storm_period_ms;
     uint32_t storm_left;
     QEMUTimer *storm_timer;
+    /*
+     * downstream-port RESET storm (the port never disconnects;
+     * the hub keeps re-signaling PORT RESET and re-resetting the child).
+     */
+    bool reset_storm;       /* nto64-reset-storm=on */
+    uint32_t reset_storm_port;
+    uint32_t reset_storm_flaps;
+    uint32_t reset_storm_period_ms;
+    uint32_t reset_storm_left;
+    QEMUTimer *reset_storm_timer;
     /* guest-armed OC asserted mid-transfer */
     bool oc_mid;                /* nto64-oc-mid-transfer=on */
     uint32_t oc_mid_port;       /* 1-based port to fault */
@@ -331,6 +341,45 @@ static void usb_hub_port_update_timer(void *opaque)
     }
 }
 
+/*
+ * the downstream-port RESET storm.  Each tick re-signals a
+ * port reset without a host request - the same observable as a
+ * SetPortFeature(PORT_RESET): the RESET status pulses, the C_RESET
+ * change bit re-asserts (via usb_hub_port_change), and the child is
+ * reset (address/config cleared, so it must re-enumerate).  The port
+ * never DISCONNECTS, so a driver that treats every reset like a
+ * disconnect tears slots down pointlessly; the recovery is a bounded
+ * wait for the storm to settle, then a re-enumerate.  An even flap
+ * count ends quiet.
+ */
+static void nto64_hub_reset_storm_tick(void *opaque)
+{
+    USBHubState *s = opaque;
+    USBHubPort *port;
+    USBDevice *child;
+
+    if (s->reset_storm_left == 0 || s->reset_storm_port == 0 ||
+        s->reset_storm_port > s->num_ports) {
+        return;
+    }
+    port = &s->ports[s->reset_storm_port - 1];
+    child = port->port.dev;
+    if (child == NULL) {
+        return;
+    }
+    s->reset_storm_left--;
+    usb_hub_port_set(port, PORT_STAT_RESET);
+    usb_hub_port_clear(port, PORT_STAT_RESET);
+    if (child->attached) {
+        usb_device_reset(child);
+        usb_hub_port_set(port, PORT_STAT_ENABLE);
+    }
+    usb_wakeup(s->intr, 0);
+    timer_mod(s->reset_storm_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              s->reset_storm_period_ms * 1000000ULL);
+}
+
 static void usb_hub_attach(USBPort *port1)
 {
     USBHubState *s = port1->opaque;
@@ -494,6 +543,18 @@ static void usb_hub_handle_control(USBDevice *dev, USBPacket *p,
             timer_mod(s->oc_mid_timer,
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                       s->oc_mid_ms * 1000000ULL);
+        }
+        break;
+    case VendorDeviceOutRequest | 0x58:
+        /*
+         * guest-only arm for the port RESET storm (no-op on
+         * clean targets).
+         */
+        if (s->reset_storm && s->reset_storm_port > 0 &&
+            s->reset_storm_port <= s->num_ports) {
+            s->reset_storm_left = s->reset_storm_flaps;
+            timer_mod(s->reset_storm_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         }
         break;
     case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
@@ -750,6 +811,7 @@ static void usb_hub_unrealize(USBDevice *dev)
 
     timer_free(s->port_timer);
     timer_free(s->storm_timer);
+    timer_free(s->reset_storm_timer);
     timer_free(s->oc_mid_timer);
 }
 
@@ -784,6 +846,8 @@ static void usb_hub_realize(USBDevice *dev, Error **errp)
                                  usb_hub_port_update_timer, s);
     s->storm_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                   nto64_hub_storm_tick, s);
+    s->reset_storm_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                        nto64_hub_reset_storm_tick, s);
     s->oc_mid_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    nto64_hub_oc_mid_tick, s);
     s->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
@@ -864,6 +928,13 @@ static const Property usb_hub_properties[] = {
     DEFINE_PROP_UINT32("nto64-storm-flaps", USBHubState, storm_flaps, 4),
     DEFINE_PROP_UINT32("nto64-storm-period-ms", USBHubState,
                        storm_period_ms, 50),
+    DEFINE_PROP_BOOL("nto64-reset-storm", USBHubState, reset_storm, false),
+    DEFINE_PROP_UINT32("nto64-reset-storm-port", USBHubState,
+                       reset_storm_port, 1),
+    DEFINE_PROP_UINT32("nto64-reset-storm-flaps", USBHubState,
+                       reset_storm_flaps, 4),
+    DEFINE_PROP_UINT32("nto64-reset-storm-period-ms", USBHubState,
+                       reset_storm_period_ms, 50),
     DEFINE_PROP_BOOL("nto64-oc-mid-transfer", USBHubState, oc_mid, false),
     DEFINE_PROP_UINT32("nto64-oc-mid-port", USBHubState, oc_mid_port, 1),
     DEFINE_PROP_UINT32("nto64-oc-mid-ms", USBHubState, oc_mid_ms, 20),

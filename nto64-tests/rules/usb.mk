@@ -203,6 +203,8 @@ run-uadrop: usbfault usb-clean.conf
 	    $(UAS_HD) \
 	    $(USB_KERNEL)
 
+USB_RSTSTORM = -device usb-hub,id=hub,ports=4,port-power=on,nto64-reset-storm=on,nto64-reset-storm-port=1,nto64-reset-storm-flaps=4,nto64-reset-storm-period-ms=50,bus=xhci.0,port=1
+
 
 EXTRA_BUILT +=
 RUNTARGETS += run-uabad run-uabadtrack run-uadrop run-uaerr run-uapersist run-uastest run-usbeject run-usbejectinflight run-usbflushlie run-usbintr run-usbintrdrop run-usbisoc run-usbss run-usbstoragebadtrack run-usbstoragedrop run-usbstorageerr run-usbstoragepersist run-usbstoragestall run-usbstoragetest run-usbwp

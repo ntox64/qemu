@@ -754,3 +754,16 @@ the command and event rings, the slots and the endpoints together.  Run
    survives, because the backend was never touched.  Isochronous transfer
    is NAK-and-re-arm only - bandwidth scheduling, microframes and real
    sample delivery are not modelled.
+
+
+Hub port reset storm
+~~~~~~~~~~~~~~~~~~~~
+
+``nto64-reset-storm`` on a hub resets a chosen port repeatedly at a chosen
+period and count.  Run ``make run-usbresetstorm``.
+
+.. note::
+   One clean unplug never exercises the reset-completion path as often as
+   four resets with a function attached.  The check is convergence -
+   device re-enumerated, endpoints torn down and rebuilt, no stuck slot -
+   rather than accumulation of state across resets.
