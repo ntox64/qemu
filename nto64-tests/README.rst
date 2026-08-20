@@ -767,3 +767,17 @@ period and count.  Run ``make run-usbresetstorm``.
    four resets with a function attached.  The check is convergence -
    device re-enumerated, endpoints torn down and rebuilt, no stuck slot -
    rather than accumulation of state across resets.
+
+
+Suspend, resume and remote wakeup
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nto64-wakeup`` makes a device request remote wakeup on a timer, against
+the hub and controller suspend state machines.  Run ``make run-usbsuspend``.
+
+.. note::
+   A suspended port must not complete transfers, resume must restore them,
+   and a device-initiated wakeup has to be noticed at both the hub and the
+   controller; the case checks the device is still addressable afterwards
+   rather than silently re-bound.  U1/U2 and the USB3 link states, and
+   host-controller power management, are out of scope.

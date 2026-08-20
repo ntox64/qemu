@@ -39,6 +39,14 @@
  * transfer NAKs once, so the xHCI services it at the NEXT interval
  * and the driver sees no transfer event for one interval (the isoc
  * stream must not wedge).
+ * This testbed adds the remote-wakeup trigger: with `nto64-wakeup=on` (+
+ * `nto64-wakeup-ms=M`) a guest-only vendor request (0x5b) arms a
+ * one-shot timer; while the bus is suspended the device signals a
+ * wake on its bulk IN endpoint.  usb_wakeup only propagates when
+ * the host armed DEVICE_REMOTE_WAKEUP on the device (and, for a
+ * device behind the hub, on the hub), and the xHCI root port only
+ * acts on it in U3 - so an unarmed host or a non-suspended port never
+ * sees the wake, exactly like real hardware.
  *
  */
 
@@ -73,6 +81,11 @@ struct Nto64UsbState {
     bool disconnect_done;
     QEMUTimer *disconnect_timer;
     QEMUTimer *replug_timer;
+    /* guest-armed remote-wakeup trigger (one-shot) */
+    bool wakeup;            /* nto64-wakeup=on */
+    uint32_t wakeup_ms;     /* nto64-wakeup-ms */
+    bool wakeup_armed;
+    QEMUTimer *wakeup_timer;
     /* isoc missed-microframe shape */
     bool isoc;
     uint32_t drop_microframe;
@@ -232,6 +245,26 @@ static void nto64_usb_handle_control(USBDevice *dev, USBPacket *p,
         data[1] = 0;
         p->actual_length = MIN(length, 2);
         break;
+    case DeviceOutRequest | USB_REQ_SET_FEATURE:
+        /*
+         * the standard SetFeature path - this device handles
+         * standard requests itself (it does not call
+         * usb_desc_handle_control), and a driver must be able to arm
+         * DEVICE_REMOTE_WAKEUP before suspend.
+         */
+        if (value == USB_DEVICE_REMOTE_WAKEUP) {
+            dev->remote_wakeup = 1;
+        } else {
+            p->status = USB_RET_STALL;
+        }
+        break;
+    case DeviceOutRequest | USB_REQ_CLEAR_FEATURE:
+        if (value == USB_DEVICE_REMOTE_WAKEUP) {
+            dev->remote_wakeup = 0;
+        } else {
+            p->status = USB_RET_STALL;
+        }
+        break;
     case VendorDeviceOutRequest | 0x56:
         /*
          * arm the mid-transfer disconnect (guest-only; the
@@ -261,10 +294,46 @@ static void nto64_usb_handle_control(USBDevice *dev, USBPacket *p,
         data[0] = s->drop_microframe_armed ? 1 : 0;
         p->actual_length = MIN(length, 1);
         break;
+    case VendorDeviceRequest | 0x5c:
+        /*
+         * report whether this device is a wake target, so
+         * the harness can tell a clean target (no wake expected) from
+         * a wake target whose wake MUST propagate.
+         */
+        data[0] = s->wakeup ? 1 : 0;
+        p->actual_length = MIN(length, 1);
+        break;
+    case VendorDeviceOutRequest | 0x5b:
+        /*
+         * guest-only arm for the remote-wakeup trigger
+         * (no-op on clean targets).
+         */
+        if (s->wakeup && !s->wakeup_armed) {
+            s->wakeup_armed = true;
+            timer_mod(s->wakeup_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      s->wakeup_ms * 1000000ULL);
+        }
+        break;
     default:
         p->status = USB_RET_STALL;
         break;
     }
+}
+
+/*
+ * the armed remote-wakeup fires while the bus is suspended.
+ * usb_wakeup only propagates if the host set DEVICE_REMOTE_WAKEUP
+ * (its gate), and the xHCI port only acts when its link state is U3
+ * (xhci_wakeup's gate), so an unarmed host or a non-suspended port
+ * never sees the wake.
+ */
+static void nto64_usb_wakeup_cb(void *opaque)
+{
+    Nto64UsbState *s = opaque;
+
+    s->wakeup_armed = false;
+    usb_wakeup(usb_ep_get(USB_DEVICE(s), USB_TOKEN_IN, 1), 0);
 }
 
 /*
@@ -413,6 +482,8 @@ static void nto64_usb_realize(USBDevice *dev, Error **errp)
                                        nto64_usb_disconnect_cb, s);
     s->replug_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    nto64_usb_replug_cb, s);
+    s->wakeup_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   nto64_usb_wakeup_cb, s);
 }
 
 static void nto64_usb_unrealize(USBDevice *dev)
@@ -421,6 +492,7 @@ static void nto64_usb_unrealize(USBDevice *dev)
 
     timer_free(s->disconnect_timer);
     timer_free(s->replug_timer);
+    timer_free(s->wakeup_timer);
 }
 
 static const Property nto64_usb_properties[] = {
@@ -436,6 +508,8 @@ static const Property nto64_usb_properties[] = {
     DEFINE_PROP_BOOL("nto64-isoc", Nto64UsbState, isoc, false),
     DEFINE_PROP_UINT32("nto64-drop-microframe", Nto64UsbState,
                        drop_microframe, 0),
+    DEFINE_PROP_BOOL("nto64-wakeup", Nto64UsbState, wakeup, false),
+    DEFINE_PROP_UINT32("nto64-wakeup-ms", Nto64UsbState, wakeup_ms, 100),
 };
 
 static void nto64_usb_class_init(ObjectClass *klass, const void *data)

@@ -48,8 +48,9 @@
  *        detaches after ~1 ms, so the transfer never completes).  The
  *        driver times out, notices the port disconnect, disables the
  *        slot, waits for the replug (nto64-replug-ms), re-enumerates
- *        and re-verifies the echo (a lost completion is retried a
- *        bounded number of times, a wrong echo is not tolerated).
+ *        on recycled rings and re-verifies the echo (a lost completion
+ *        is retried a bounded number of times, a wrong echo is not
+ *        tolerated).
  *   a8 - hub-port connect/disconnect storm: a guest-only
  *        vendor request to the hub starts nto64-port-storm (the
  *        downstream port's child detaches/attaches storm-flaps times);
@@ -65,6 +66,17 @@
  *        wait for the first C_RESET, settles past the storm
  *        (stability window), then re-enumerates on recycled rings and
  *        verifies the echo.
+ *   a11 - suspend/resume + remote wakeup: the driver sets
+ *        DEVICE_REMOTE_WAKEUP on the composite AND the hub (a device
+ *        behind the hub only wakes if both are armed), arms the
+ *        composite's wake trigger (vendor 0x5b, nto64-wakeup), then
+ *        suspends the hub's downstream port and the xHCI root port
+ *        (PORTSC PLS=U3).  The device's wake timer signals a remote
+ *        wakeup that propagates through the hub (PLS=Resume + PLC
+ *        event); the driver completes the resume (PLS=U0), clears the
+ *        port change and re-verifies the echo.  Clean targets: the
+ *        arm is a no-op, no wake appears, and the driver still
+ *        resumes the port (a11=2 on the fault target, a11=1 clean).
  *
  * Verified target matrix (run-* targets, all f=0):
  *   run-usbmisbehave:  a1=4 a2=1 a3=1 a4=1 a5=1 a6=0 (clean)
@@ -74,6 +86,8 @@
  *                      CLEAR_FEATURE -> retry ok)
  *   run-usbresetstorm: a1=4 a10=2 (reset storm -> settle ->
  *                      re-enumerate -> echo ok)
+ *   run-usbsuspend:    a1=4 a11=2 (remote wakeup -> resume ->
+ *                      echo ok)
  *   run-usbbadreport:  a1=4 a3=2 (truncated report -> same recovery)
  *   run-usboc:         a1=4 a4=2 (OC -> power cycle -> re-enumerate)
  *   run-usbocpersist:  a1=4 a4=2 (OC survives power cycles -> bounded
@@ -91,11 +105,12 @@
  *   run-usbenum:       a1=3 a6=4 (four enumeration-fault devices
  *                      rejected, healthy devices all up)
  *   run-usbpower:      a1=4 a6=1 (over-budget device rejected)
- *   Every target also runs thephases in their clean shape
- *   (a7=1 a8=1 a10=1); run-usbdisconnect additionally expects a7=2
- *   (the mid-transfer disconnect -> teardown -> replug -> re-enumerate),
- *   run-usbstorm a8=2 (storm -> settle -> re-enumerate) and
- *   run-usbresetstorm a10=2 (reset storm -> settle -> re-enumerate).
+ *   Every target also runs thephases in their clean
+ *   shape (a7=1 a8=1 a10=1 a11=1); run-usbdisconnect additionally
+ *   expects a7=2 (the mid-transfer disconnect -> teardown -> replug
+ *   -> re-enumerate), run-usbstorm a8=2 (storm -> settle ->
+ *   re-enumerate), run-usbresetstorm a10=2 (reset storm -> settle ->
+ *   re-enumerate) and run-usbsuspend a11=2 (remote wakeup -> resume).
  * The HID data faults are armed by SET_IDLE (only the guest driver
  * sends it), so BIOS boot enumeration cannot consume them.
  * The over-current fault is armed by the hub's SET_CONFIGURATION for
@@ -150,6 +165,11 @@
 #define PORT_SPEED_MASK 0x3c00
 #define PORT_SPEED_FULL 0x400
 #define PORT_SPEED_HIGH 0xc00
+#define PORTSC_PLS_MASK 0x3e0
+#define PORTSC_PLS_U3   0x60
+#define PORTSC_PLS_RESUME 0x1e0
+#define PORTSC_LWS      0x10000
+#define PORTSC_PLC      0x400000
 #define PORT_CSC        0x20000
 #define PORT_PEC        0x40000
 #define PORT_PRC        0x200000
@@ -235,9 +255,11 @@
 
 /* hub class request values (USB 2.0 11.24) */
 #define PORT_FEAT_RESET         4
+#define PORT_FEAT_SUSPEND       2
 #define PORT_FEAT_POWER         8
 #define PORT_FEAT_C_OVERCURRENT 19
 #define PORT_FEAT_C_RESET       20
+#define USB_FEATURE_REMOTE_WAKEUP 1
 
 /* xHCI endpoint types */
 #define EP_BULK_OUT     2
@@ -248,6 +270,7 @@
     .section .text
     .globl _start
 _start:
+    movl %ebx, mbi_ptr          /* save the multiboot info pointer (EBX) */
     movl $stack_top, %esp
     andl $-16, %esp
     movl $5000, tx_bound
@@ -342,6 +365,7 @@ found_xhci:
     call phase_a8
     call phase_a9
     call phase_a10
+    call phase_a11
     call report
     jmp halt
 
@@ -773,6 +797,31 @@ xhci_ctrl:
 9:  movl $0xffffffff, %eax
     movl $0xffffffff, %edx
     ret
+
+/* ctrl_retry: xhci_ctrl with a bounded retry - thexhci
+ * event-ring quirk after a replug can lose/stale a completion though
+ * the device served the request, so a driver retries (idempotent
+ * requests only).  Same args as xhci_ctrl; returns eax = cc
+ * (0xffffffff if every attempt timed out). */
+ctrl_retry:
+    movl $3, ctrl_attempts
+1:  pushl %ebx
+    pushl %ecx
+    pushl %edx
+    pushl %esi
+    call xhci_ctrl
+    popl %esi
+    popl %edx
+    popl %ecx
+    popl %ebx
+    cmpl $0xffffffff, %eax
+    jne 2f
+    decl ctrl_attempts
+    jz 2f
+    movl $20, %ecx
+    call wait_ticks
+    jmp 1b
+2:  ret
 
 /* xhci_tx: transfer on the current device's data endpoint.
  * esi = data ptr, ecx = length, ebp = 1 for IN, edi = DCI (2..9).
@@ -2405,6 +2454,11 @@ phase_a7:
     je fail_phase
     movl %eax, cur_dev
     call dev_disable
+    /* recycle the composite's rings before the replug bring-up: the old
+     * 0x56 arm TRB is still in that EP0 ring, and a fresh slot consuming
+     * from ring base with C=1 re-arms the disconnect with it */
+    movl cur_dev, %eax
+    call dev_rings_recycle
     /* wait for the replug, then reset the port and re-enumerate */
     movl hub_dev, %eax
     movl %eax, cur_dev
@@ -2701,6 +2755,125 @@ phase_a10:
     jnz fail_phase
 9:  ret
 
+/* phase_a11: suspend/resume + remote wakeup.  The driver
+ * arms DEVICE_REMOTE_WAKEUP on the composite AND the hub (a device
+ * behind the hub only wakes if both are armed), arms the composite's
+ * wake trigger (vendor 0x5b), then suspends the hub's downstream port
+ * and the xHCI root port (PORTSC PLS=U3).  The device's wake timer
+ * signals a remote wakeup that propagates through the hub to the root
+ * port (PLS=Resume + PLC event, USB 2.0 7.1.7.7 / xHCI 5.4.8); the
+ * driver completes the resume (PLS=U0), clears the port change and
+ * re-verifies the echo.  The arming control transfers use a bounded
+ * retry and tolerate a lost completion (thexhci event-ring
+ * quirk after a replug can drop the completion though the device
+ * served the request); the WAKE OBSERVATION is the proof - a target
+ * whose device reports wake support (vendor 0x5c) MUST wake (a11=2),
+ * a clean target must NOT (a11=1, and the port is resumed anyway). */
+phase_a11:
+    movl $1, a11
+    /* 1. arm DEVICE_REMOTE_WAKEUP on the composite */
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    movl $setup_sfdev, %ebx
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    xorl %esi, %esi
+    call ctrl_retry
+    /* 2. arm DEVICE_REMOTE_WAKEUP on the hub (the wake must propagate
+     * through it) */
+    movl $KIND_HUB, %ebx
+    call find_kind
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    movl $setup_sfdev, %ebx
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    xorl %esi, %esi
+    call ctrl_retry
+    /* 3. arm the composite's wake trigger (vendor 0x5b), then ask the
+     * device whether it is a wake target (vendor 0x5c) */
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    movl $setup_arm5b, %ebx
+    xorl %ecx, %ecx
+    xorl %edx, %edx
+    xorl %esi, %esi
+    call ctrl_retry
+    movl $0, wake_status_buf
+    movl $setup_status5c, %ebx
+    movl $wake_status_buf, %ecx
+    movl $1, %edx
+    movl $1, %esi
+    call ctrl_retry
+    movzbl wake_status_buf, %eax
+    movl %eax, a11_wake_supported
+    /* 4. suspend the hub's downstream port (hub-class PORT_SUSPEND) */
+    movl $KIND_HUB, %ebx
+    call find_kind
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    movl $PORT_FEAT_SUSPEND, %ebx
+    movl $1, %esi
+    call hub_set_feature
+    /* 5. clear any stale port-change bit, then suspend the xHCI root
+     * port (PORTSC LWS=1 PLS=U3) */
+    movl $1, port_used
+    call portsc_read
+    orl $PORTSC_PLC, %eax
+    call portsc_write
+    call portsc_read
+    orl $(PORTSC_LWS | PORTSC_PLS_U3), %eax
+    call portsc_write
+    /* 6. wait for the remote wake (link state Resume / PLC event) */
+    movl $1, port_used
+    movl $2000, %ecx
+    call wait_port_wake
+    jc 6f
+    movl $2, a11
+    jmp 7f
+6:  /* no wake: a wake-capable device that never woke is a failure; a
+     * clean target stays a11=1 and still resumes the port */
+    cmpl $0, a11_wake_supported
+    jne fail_phase
+7:  /* resume: wait out the resume signaling, then write PLS=U0 and
+     * clear the port-change bit */
+    movl $50, %ecx
+    call wait_ticks
+    movl $1, port_used
+    call portsc_read
+    andl $~PORTSC_PLS_MASK, %eax
+    orl $PORTSC_LWS, %eax
+    call portsc_write
+    movl $1, port_used
+    call portsc_read
+    orl $PORTSC_PLC, %eax
+    call portsc_write
+    /* clear the hub port's suspend feature (the wake already cleared
+     * the status bit through usb_hub_wakeup) */
+    movl $KIND_HUB, %ebx
+    call find_kind
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    movl $PORT_FEAT_SUSPEND, %ebx
+    movl $1, %esi
+    call hub_clear_feature
+    /* 8. the composite must work again after resume */
+    call find_composite
+    cmpl $-1, %eax
+    je fail_phase
+    movl %eax, cur_dev
+    call comp_verify_a
+    testl %eax, %eax
+    jnz fail_phase
+9:  ret
+
 /* wait_oc_present: wait up to ecx ticks for the OC status/change
  * bits on oc_port_cur (cur_dev must be the hub).  CF=0 + edx=bits
  * when present, CF=1 on timeout. */
@@ -2889,6 +3062,33 @@ wait_hub_port_reset_storm_end:
     stc
     ret
 
+/* wait_port_wake: poll root PORTSC (port_used) until the link state
+ * is Resume (the remote wakeup drove the port out of U3) or the PLC
+ * change bit is set.  ecx = bound ticks; carry on timeout. */
+wait_port_wake:
+    movl ticks, %eax
+    addl %eax, %ecx
+    movl %ecx, hub_wait_deadline
+1:  call portsc_read
+    movl %eax, %edx
+    andl $PORTSC_PLS_MASK, %edx
+    cmpl $PORTSC_PLS_RESUME, %edx
+    je 8f
+    testl $PORTSC_PLC, %eax
+    jnz 8f
+    movl $1, %ecx
+    call wait_ticks
+    movl ticks, %eax
+    cmpl hub_wait_deadline, %eax
+    jae 9f
+    jmp 1b
+8:  xorl %eax, %eax
+    clc
+    ret
+9:  movl $0xffffffff, %eax
+    stc
+    ret
+
 /* ================================================================== */
 /* helpers                                                           */
 /* ================================================================== */
@@ -2994,7 +3194,45 @@ irq_stub:
     popal
     iret
 
+/* nto64_expect + hex helper come from the shared include. */
+.set NTO64_NEEDS_SEQ, 1
+.set NTO64_EXPECT_COUNT, 11
+.include "nto64-expect.inc"
+
+/* verify_expect: compare each phase to the expected-value string (one
+ * hex digit per phase, in report order: a1..a11).  A dead fault hook
+ * leaves a phase at its clean value, which then mismatches, so a fault
+ * run cannot silently pass. */
+.macro CHECK_EXPECT off, var
+    movl expect+\off, %eax
+    cmpl %eax, \var
+    je .Lve_ok_\off
+    incl fail
+.Lve_ok_\off:
+.endm
+
+verify_expect:
+    call nto64_expect_seq
+    cmpl $NTO64_EXPECT_COUNT, %eax
+    jne .Lve_noexpect
+    CHECK_EXPECT 0, a1
+    CHECK_EXPECT 4, a2
+    CHECK_EXPECT 8, a3
+    CHECK_EXPECT 12, a4
+    CHECK_EXPECT 16, a5
+    CHECK_EXPECT 20, a6
+    CHECK_EXPECT 24, a7
+    CHECK_EXPECT 28, a8
+    CHECK_EXPECT 32, a9
+    CHECK_EXPECT 36, a10
+    CHECK_EXPECT 40, a11
+    ret
+.Lve_noexpect:
+    incl fail
+    ret
+
 report:
+    call verify_expect
     movl $msg, %esi
     call puts
     movl a1, %eax
@@ -3034,6 +3272,10 @@ report:
     movl $sp_a10, %esi
     call puts
     movl a10, %eax
+    call puthex
+    movl $sp_a11, %esi
+    call puts
+    movl a11, %eax
     call puthex
     movl $sp_f, %esi
     call puts
@@ -3087,10 +3329,16 @@ a7:         .long 0
 a8:         .long 0
 a9:         .long 0
 a10:        .long 0
+a11:        .long 0
+a11_wake_supported: .long 0
+ctrl_attempts: .long 0
 verify_attempts: .long 0
+wake_status_buf: .space 4
 tx_bound:   .space 4
 hub_wait_deadline: .space 4
 fail:       .long 0
+mbi_ptr:    .long 0
+expect:     .space 64
 ev_ring:    .long 0
 ev_off:     .long 0
 ev_ccs:     .long 0
@@ -3165,6 +3413,15 @@ setup_arm57:.byte 0x40,0x57,0x00,0x00,0x00,0x00,0x00,0x00
 /* vendor arm for the hub-port RESET storm (usb-hub
  * nto64-reset-storm) - bRequest 0x58. */
 setup_arm58:.byte 0x40,0x58,0x00,0x00,0x00,0x00,0x00,0x00
+/* SetFeature(DEVICE_REMOTE_WAKEUP) - bmRequestType 0x00
+ * (standard device-out), bRequest 0x03, wValue 1. */
+setup_sfdev: .byte 0x00,0x03,0x01,0x00,0x00,0x00,0x00,0x00
+/* vendor arm for the remote-wakeup trigger (usb-nto64
+ * nto64-wakeup) - bRequest 0x5b. */
+setup_arm5b: .byte 0x40,0x5b,0x00,0x00,0x00,0x00,0x00,0x00
+/* vendor status read - is this device a wake target?
+ * (bmRequestType 0xc0 vendor-device-in, bRequest 0x5c). */
+setup_status5c: .byte 0xc0,0x5c,0x00,0x00,0x00,0x00,0x01,0x00
 pattern_a:  .fill 16, 4, 0x11111111
 pattern_b:  .fill 16, 4, 0x22222222
 
@@ -3190,5 +3447,6 @@ sp_a7:      .asciz " a7="
 sp_a8:      .asciz " a8="
 sp_a9:      .asciz " a9="
 sp_a10:     .asciz " a10="
+sp_a11:     .asciz " a11="
 sp_f:       .asciz " f="
 nl:         .asciz "\n"
