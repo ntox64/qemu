@@ -400,3 +400,24 @@ and verify that the interrupted transfer is retried to completion.
    that matters for a driver is partial progress - a chunk overlapping the
    window faults *after* the earlier chunks have completed and been
    counted, so a fault does not mean "nothing happened".
+
+
+AER error injection
+~~~~~~~~~~~~~~~~~~~
+
+``nto64-dma`` is an express device with a PCIe endpoint capability and
+the Advanced Error Reporting extended capability; writing to BAR0
+``0x94`` arms a correctable, an uncorrectable non-fatal or a fatal error
+and injects it through ``pcie_aer_inject_error()``.
+
+Run ``make run-aertest``, which walks the extended capability list via
+ECAM, checks the status bits, the big-endian TLP header log, the injection
+count and the write-1-to-clear behaviour, and confirms a fatal error is
+distinguishable from a non-fatal one in the log a driver would print.
+
+.. note::
+   Injection only.  There is no link training state machine, so a real
+   downstream-port containment and recovery sequence is out of reach.
+   Reaching the capability at all is part of the test: ``CF8``/``CFC``
+   only addresses the first 256 bytes and wraps above that, so anything
+   from ``0x100`` on has to go through ECAM.

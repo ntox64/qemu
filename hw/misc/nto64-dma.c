@@ -49,6 +49,12 @@
  *     0x7c/0x80 fault address low/high (first faulting byte)
  *     0x84 fault count (number of faults latched)
  *     0x88/0x8c fault window base low/high, 0x90 window size bytes
+ *     0x94 PCIe AER inject: write "AERC" (0x43524541) -> correctable
+ *         (Receiver Error), "AERU" (0x55524541) -> uncorrectable
+ *         non-fatal (Data Link Protocol), "AERF" (0x46524541) ->
+ *         uncorrectable fatal (Internal Error); each logs through the
+ *         device's AER capability (extended config cap id 1),
+ *         0x98 = AER inject count (write 0 clears)
  *          (0 disables the window; the window models a not-present
  *          range in the device's page tables - a PRI/ATS-style
  *          device fault)
@@ -110,6 +116,8 @@
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_device.h"
 #include "hw/pci/msix.h"
+#include "hw/pci/pcie.h"
+#include "hw/pci/pcie_aer.h"
 #include "hw/qdev-properties.h"
 #include "system/address-spaces.h"
 #include "qemu/main-loop.h"
@@ -129,6 +137,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(Nto64DmaState, NTO64_DMA)
 #define NTO64_DMA_MAX_XFER (1 * GiB)   /* default single-transfer cap */
 #define NTO64_DMA_QUEUE_MAX 16
 #define NTO64_DMA_QUEUES_DEFAULT 4
+#define NTO64_DMA_EXP_OFFSET 0x90       /* PCIe endpoint cap (regular) */
+#define NTO64_DMA_AER_OFFSET 0x100      /* AER cap (extended) */
+#define NTO64_DMA_AER_COR  0x43524541u  /* "AERC" */
+#define NTO64_DMA_AER_UNC  0x55524541u  /* "AERU" */
+#define NTO64_DMA_AER_FAT  0x46524541u  /* "AERF" */
 
 #define NTO64_DMA_CTRL_START 0x1
 #define NTO64_DMA_CTRL_IRQ   0x2
@@ -154,7 +167,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Nto64DmaState, NTO64_DMA)
 typedef struct Nto64DmaState {
     PCIDevice pdev;
     MemoryRegion ctrl;
-    AddressSpace dma_as;
+    AddressSpace *dma_as;     /* heap: released by address_space_destroy_free() */
     MemoryRegion *dma_root;
     uint32_t node;
     uint32_t control;
@@ -183,7 +196,7 @@ typedef struct Nto64DmaState {
     PCIDevice *peer;          /* `peer` property: P2P target device */
     uint32_t peer_bar;        /* `peer-bar` property: BAR on the peer */
     MemoryRegion *peer_mr;    /* resolved peer BAR memory region */
-    AddressSpace peer_as;     /* AS rooted at the peer BAR (P2P side) */
+    AddressSpace *peer_as;    /* AS rooted at the peer BAR (P2P side) */
     uint32_t p2p_xfers;       /* P2P transfers completed */
     uint64_t p2p_bytes;       /* P2P bytes moved */
     uint32_t fault_ctrl;      /* fault control (0x74) */
@@ -192,6 +205,7 @@ typedef struct Nto64DmaState {
     uint32_t fault_count;     /* faults latched (0x84) */
     uint64_t fault_win_base;  /* fault window base (0x88/0x8c) */
     uint32_t fault_win_size;  /* fault window size (0x90), 0 = off */
+    uint32_t aer_count;       /* AER injections (0x98) */
     bool retry_ring;          /* the faulted op was a ring batch */
     unsigned retry_queue;     /* ...and which queue */
     QEMUBH *bh;
@@ -203,7 +217,7 @@ typedef struct Nto64DmaState {
  */
 typedef struct Nto64DmaQueue {
     MemoryRegion *root;
-    AddressSpace as;
+    AddressSpace *as;
     uint64_t ring_base;
     uint32_t ring_count;
     uint32_t ring_stride;
@@ -255,8 +269,8 @@ static Nto64DmaResult nto64_dma_copy_checked(Nto64DmaState *s,
                                              bool src_peer, bool dst_peer,
                                              uint8_t *buf)
 {
-    AddressSpace *src_as = src_peer ? &s->peer_as : dev_as;
-    AddressSpace *dst_as = dst_peer ? &s->peer_as : dev_as;
+    AddressSpace *src_as = src_peer ? s->peer_as : dev_as;
+    AddressSpace *dst_as = dst_peer ? s->peer_as : dev_as;
     uint64_t off;
 
     if ((s->fault_ctrl & NTO64_DMA_FAULT_INJECT) && len) {
@@ -300,12 +314,11 @@ static Nto64DmaResult nto64_dma_xfer(Nto64DmaState *s, AddressSpace *dev_as,
 {
     /*
      * A ring descriptor may name either endpoint as a peer BAR offset
-     * even when the device has no `peer` (s->peer_mr stays NULL and
-     * the peer address space is never initialised).  That is a
-     * guest/descriptor error - fail the transfer like the bulk P2P
-     * path does instead of walking an uninitialised address space.
+     * even when the device has no `peer` (s->peer_as is NULL then).
+     * That is a guest/descriptor error: fail the transfer like the
+     * bulk P2P path does instead of handing NULL to address_space_rw().
      */
-    if ((src_peer || dst_peer) && !s->peer_mr) {
+    if ((src_peer || dst_peer) && !s->peer_as) {
         return NTO64_DMA_ERR;
     }
     return nto64_dma_copy_checked(s, dev_as, src, dst, len,
@@ -324,7 +337,7 @@ static Nto64DmaResult nto64_dma_copy_peer(Nto64DmaState *s, hwaddr src,
     if (!s->peer_mr) {
         return NTO64_DMA_ERR;
     }
-    return nto64_dma_xfer(s, &s->dma_as, src, dst, len, rev, !rev,
+    return nto64_dma_xfer(s, s->dma_as, src, dst, len, rev, !rev,
                           s->bounce);
 }
 
@@ -374,18 +387,25 @@ static void nto64_dma_ring_q(Nto64DmaState *s, unsigned q)
         Nto64DmaDesc d;
 
         daddr = qq->ring_base + (uint64_t)i * qq->ring_stride;
-        if (address_space_read(&qq->as, daddr, MEMTXATTRS_UNSPECIFIED,
+        if (address_space_read(qq->as, daddr, MEMTXATTRS_UNSPECIFIED,
                                &d, sizeof(d)) != MEMTX_OK) {
-            break;
+            /*
+             * truncated / unmapped ring: a real engine latches an
+             * error instead of reporting DONE (2026-08-22 fix).
+             */
+            s->status = NTO64_DMA_ST_ERR;
+            return;
         }
         if (!(d.flags & 1)) {
-            break;
+            /* the valid bit ran out before ring_count: truncated. */
+            s->status = NTO64_DMA_ST_ERR;
+            return;
         }
         if (d.len > s->max_xfer) {
             s->status = NTO64_DMA_ST_ERR;
             return;
         }
-        switch (nto64_dma_xfer(s, &qq->as, d.src, d.dst, d.len,
+        switch (nto64_dma_xfer(s, qq->as, d.src, d.dst, d.len,
                                !!(d.flags & NTO64_DMA_DESC_PEER_SRC),
                                !!(d.flags & NTO64_DMA_DESC_PEER_DST),
                                s->bounce)) {
@@ -399,7 +419,7 @@ static void nto64_dma_ring_q(Nto64DmaState *s, unsigned q)
             break;
         }
         d.flags |= 2;
-        if (address_space_write(&qq->as, daddr + 12,
+        if (address_space_write(qq->as, daddr + 12,
                                 MEMTXATTRS_UNSPECIFIED, &d.flags,
                                 4) != MEMTX_OK) {
             s->status = NTO64_DMA_ST_ERR;
@@ -416,7 +436,10 @@ static void nto64_dma_ring_q(Nto64DmaState *s, unsigned q)
             msix_notify(&s->pdev, q);
         }
     }
-    s->status = NTO64_DMA_ST_DONE;
+    /* a latched error (e.g. start-while-busy) survives the completion */
+    if (!(s->status & NTO64_DMA_ST_ERR)) {
+        s->status = NTO64_DMA_ST_DONE;
+    }
 }
 
 /* Snapshot the register-set bulk transfer parameters at start/retry. */
@@ -488,7 +511,7 @@ static void nto64_dma_bh(void *opaque)
         if (s->bulk_p2p) {
             r = nto64_dma_copy_peer(s, src, dst, chunk);
         } else {
-            r = nto64_dma_copy_checked(s, &s->dma_as, src, dst, chunk,
+            r = nto64_dma_copy_checked(s, s->dma_as, src, dst, chunk,
                                        false, false, s->bounce);
         }
         if (r == NTO64_DMA_FAULT) {
@@ -517,7 +540,9 @@ static void nto64_dma_bh(void *opaque)
         s->p2p_bytes += s->bulk_len;
         s->xfers++;
         s->bytes += s->bulk_len;
-        s->status = NTO64_DMA_ST_DONE;
+        if (!(s->status & NTO64_DMA_ST_ERR)) {
+            s->status = NTO64_DMA_ST_DONE;
+        }
         if (s->control & NTO64_DMA_CTRL_IRQ) {
             msix_notify(&s->pdev, 0);
         }
@@ -530,7 +555,9 @@ static void nto64_dma_bh(void *opaque)
 
     s->xfers++;
     s->bytes += s->bulk_len;
-    s->status = NTO64_DMA_ST_DONE;
+    if (!(s->status & NTO64_DMA_ST_ERR)) {
+        s->status = NTO64_DMA_ST_DONE;
+    }
     if (s->control & NTO64_DMA_CTRL_IRQ) {
         msix_notify(&s->pdev, 0);
     }
@@ -541,6 +568,11 @@ static void nto64_dma_bh(void *opaque)
 static void nto64_dma_start(Nto64DmaState *s)
 {
     if (s->status & NTO64_DMA_ST_BUSY) {
+        /*
+         * start-while-busy must not be silently dropped: latch the
+         * error like a real engine (2026-08-22 fix).
+         */
+        s->status = NTO64_DMA_ST_ERR;
         return;
     }
     if (!(s->control & NTO64_DMA_CTRL_RING)) {
@@ -553,7 +585,11 @@ static void nto64_dma_start(Nto64DmaState *s)
 /* Start one queue's ring batch asynchronously (0x54). */
 static void nto64_dma_start_queue(Nto64DmaState *s, unsigned q)
 {
-    if (q >= s->queues_n || (s->status & NTO64_DMA_ST_BUSY)) {
+    if (q >= s->queues_n) {
+        return;
+    }
+    if (s->status & NTO64_DMA_ST_BUSY) {
+        s->status = NTO64_DMA_ST_ERR;
         return;
     }
     s->ring_queue = q;
@@ -654,6 +690,8 @@ static uint64_t nto64_dma_read(void *opaque, hwaddr addr, unsigned size)
         return (uint32_t)(s->fault_win_base >> 32);
     case 0x90:
         return s->fault_win_size;
+    case 0x98:
+        return s->aer_count;
     default:
         return 0;
     }
@@ -769,6 +807,49 @@ static void nto64_dma_write(void *opaque, hwaddr addr,
     case 0x90:
         s->fault_win_size = (uint32_t)val;
         break;
+    case 0x94:
+        /*
+         * PCIe AER injection (Step-gap transport-error fold): the guest
+         * arms a correctable / uncorrectable (non-fatal) / uncorrectable
+         * (fatal) error through the standard AER log.  The guest then
+         * observes the device's AER capability in config space.
+         */
+        if (val == NTO64_DMA_AER_COR) {
+            PCIEAERErr err = {
+                .status = PCI_ERR_COR_RCVR,
+                .flags = PCIE_AER_ERR_IS_CORRECTABLE |
+                         PCIE_AER_ERR_HEADER_VALID,
+                .header = { 0x00001234, 0x00005678,
+                            0x00009abc, 0x0000def0 },
+            };
+            if (pcie_aer_inject_error(&s->pdev, &err) == 0) {
+                s->aer_count++;
+            }
+        } else if (val == NTO64_DMA_AER_UNC) {
+            PCIEAERErr err = {
+                .status = PCI_ERR_UNC_DLP,
+                .flags = PCIE_AER_ERR_HEADER_VALID,
+                .header = { 0x00001234, 0x00005678,
+                            0x00009abc, 0x0000def0 },
+            };
+            if (pcie_aer_inject_error(&s->pdev, &err) == 0) {
+                s->aer_count++;
+            }
+        } else if (val == NTO64_DMA_AER_FAT) {
+            PCIEAERErr err = {
+                .status = PCI_ERR_UNC_INTN,
+                .flags = PCIE_AER_ERR_HEADER_VALID,
+                .header = { 0x00001234, 0x00005678,
+                            0x00009abc, 0x0000def0 },
+            };
+            if (pcie_aer_inject_error(&s->pdev, &err) == 0) {
+                s->aer_count++;
+            }
+        }
+        break;
+    case 0x98:
+        s->aer_count = 0;
+        break;
     default:
         break;
     }
@@ -784,11 +865,63 @@ static const MemoryRegionOps nto64_dma_ops = {
     },
 };
 
+/*
+ * Release what the engine registered for itself.  This has to cover a
+ * failed realize as well as a normal unplug, because a device whose
+ * realize returns an error never runs its .exit (pci_qdev_realize() just
+ * unregisters the function).  The per-queue AddressSpace objects live
+ * while being linked into the global address_spaces list - which every
+ * memory transaction commit walks, and whose tail pointer the next
+ * address_space_init() writes through - so they must leave that list
+ * before the object holding them is freed.  address_space_destroy()
+ * only detaches the AddressSpace; the object itself is torn down from
+ * an RCU callback (readers keep walking the old flatview until the
+ * grace period ends), so whoever owns the memory holding it must still
+ * be alive then.  Every AS here is therefore its own heap allocation,
+ * released with address_space_destroy_free(), which frees it from that
+ * callback - this state (and the @queues array of pointers) can go away
+ * as soon as the call returns.
+ * Safe to call twice and at any point in realize.
+ */
+static void nto64_dma_release(Nto64DmaState *s)
+{
+    int i;
+
+    if (s->bh) {
+        qemu_bh_delete(s->bh);
+        s->bh = NULL;
+    }
+    g_free(s->bounce);
+    s->bounce = NULL;
+
+    if (s->queues) {
+        for (i = 0; i < s->queues_n; i++) {
+            /* as is set exactly when that queue's AS was initialised */
+            if (s->queues[i].as) {
+                address_space_destroy_free(s->queues[i].as);
+                s->queues[i].as = NULL;
+            }
+        }
+        g_free(s->queues);
+        s->queues = NULL;
+    }
+    if (s->peer_as) {
+        address_space_destroy_free(s->peer_as);
+        s->peer_as = NULL;
+        s->peer_mr = NULL;
+    }
+    if (s->dma_as) {
+        address_space_destroy_free(s->dma_as);
+        s->dma_as = NULL;
+        s->dma_root = NULL;
+    }
+}
+
 static void nto64_dma_realize(PCIDevice *pci_dev, Error **errp)
 {
     Nto64DmaState *s = NTO64_DMA(pci_dev);
     CPUState *cpu = qemu_get_cpu(s->node);
-    int i, j;
+    int i;
 
     if (!s->iommu && (!cpu || !cpu->memory)) {
         error_setg(errp, "nto64-dma: node %u has no memory view",
@@ -817,7 +950,8 @@ static void nto64_dma_realize(PCIDevice *pci_dev, Error **errp)
     } else {
         s->dma_root = cpu->memory;
     }
-    address_space_init(&s->dma_as, s->dma_root, "nto64-dma-as");
+    s->dma_as = g_new0(AddressSpace, 1);
+    address_space_init(s->dma_as, s->dma_root, "nto64-dma-as");
     if (s->peer) {
         if (s->peer_bar >= PCI_NUM_REGIONS ||
             !s->peer->io_regions[s->peer_bar].memory ||
@@ -825,10 +959,11 @@ static void nto64_dma_realize(PCIDevice *pci_dev, Error **errp)
              PCI_BASE_ADDRESS_SPACE_IO)) {
             error_setg(errp, "nto64-dma: peer BAR %u is not a memory BAR",
                        s->peer_bar);
-            return;
+            goto out_err;
         }
         s->peer_mr = s->peer->io_regions[s->peer_bar].memory;
-        address_space_init(&s->peer_as, s->peer_mr, "nto64-dma-peer-as");
+        s->peer_as = g_new0(AddressSpace, 1);
+        address_space_init(s->peer_as, s->peer_mr, "nto64-dma-peer-as");
         info_report("nto64-dma: P2P peer %s BAR %u",
                     object_get_canonical_path_component(OBJECT(s->peer)),
                     s->peer_bar);
@@ -846,25 +981,13 @@ static void nto64_dma_realize(PCIDevice *pci_dev, Error **errp)
                 error_setg(errp,
                            "nto64-dma: queue %u needs vCPU %u memory view",
                            i, i);
-                /*
-                 * The queues set up so far are linked into the global
-                 * address_spaces list - walked by every memory
-                 * transaction commit, and the list's tail pointer is the
-                 * next address_space_init()'s write target - so they have
-                 * to leave that list before the array holding them goes
-                 * away.  A failed realize never runs the device's .exit.
-                 */
-                for (j = 0; j < i; j++) {
-                    address_space_destroy(&s->queues[j].as);
-                }
-                g_free(s->queues);
-                s->queues = NULL;
-                return;
+                goto out_err;
             }
             qq->root = qc->memory;
         }
         qq->ring_stride = 16;
-        address_space_init(&qq->as, qq->root, "nto64-dma-q-as");
+        qq->as = g_new0(AddressSpace, 1);
+        address_space_init(qq->as, qq->root, "nto64-dma-q-as");
     }
     s->bh = qemu_bh_new(nto64_dma_bh, s);
     s->bounce = g_malloc(NTO64_DMA_CHUNK);
@@ -876,35 +999,39 @@ static void nto64_dma_realize(PCIDevice *pci_dev, Error **errp)
 
     /* queues_n completion vectors + one fault vector */
     if (msix_init_exclusive_bar(pci_dev, s->queues_n + 1, 1, errp)) {
-        return;
+        goto out_err;
     }
     for (i = 0; i <= s->queues_n; i++) {
         msix_vector_use(pci_dev, i);
     }
+    /*
+     * PCIe endpoint capability + AER (the transport-error testbed
+     * hook): the guest arms injections via BAR0+0x94.
+     */
+    pcie_endpoint_cap_init(pci_dev, NTO64_DMA_EXP_OFFSET);
+    if (pcie_aer_init(pci_dev, PCI_ERR_VER, NTO64_DMA_AER_OFFSET,
+                      PCI_ERR_SIZEOF, errp) < 0) {
+        msix_uninit_exclusive_bar(pci_dev);
+        goto out_err;
+    }
     info_report("nto64-dma: ready (%u queues, queue i -> vCPU i; "
                 "bulk DMA AS bound to vCPU %u; fault vector %u)",
                 s->queues_n, s->node, s->queues_n);
+    return;
+
+out_err:
+    nto64_dma_release(s);
 }
 
 static void nto64_dma_exit(PCIDevice *pci_dev)
 {
     Nto64DmaState *s = NTO64_DMA(pci_dev);
-    int i;
 
     msix_unuse_all_vectors(pci_dev);
     msix_uninit_exclusive_bar(pci_dev);
-    qemu_bh_delete(s->bh);
-    g_free(s->bounce);
-    s->bounce = NULL;
-    address_space_destroy(&s->dma_as);
-    if (s->peer_mr) {
-        address_space_destroy(&s->peer_as);
-    }
-    for (i = 0; i < s->queues_n; i++) {
-        address_space_destroy(&s->queues[i].as);
-    }
-    g_free(s->queues);
-    s->queues = NULL;
+    pcie_aer_exit(pci_dev);
+    pcie_cap_exit(pci_dev);
+    nto64_dma_release(s);
 }
 
 static const Property nto64_dma_props[] = {
@@ -943,7 +1070,12 @@ static const TypeInfo nto64_dma_info = {
     .instance_size = sizeof(Nto64DmaState),
     .class_init = nto64_dma_class_init,
     .interfaces = (InterfaceInfo[]) {
-        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        /*
+         * Express (NVMe-style): 4 KiB config space + the PCIe/AER
+         * capabilities, on q35 (ECAM) and the legacy pc machine
+         * alike.
+         */
+        { INTERFACE_PCIE_DEVICE },
         { }
     },
 };

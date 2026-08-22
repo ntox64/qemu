@@ -20,6 +20,18 @@ run-pritest: pritest
 	    -device nto64-dma,queues=1 \
 	    -kernel pritest -serial stdio -display none -no-reboot
 
+aertest: aertest.S
+	# --build-id=none: see the numatest comment (multiboot span trap).
+	gcc -m32 -nostdlib -static -fno-pie \
+	    -Wl,--build-id=none \
+	    -Wl,-Ttext=0x101000 -Wl,--section-start=.multiboot=0x100000 \
+	    -o $@ $<
+
+run-aertest: aertest
+	$(QEMU) -machine q35 -m 64 \
+	    -device nto64-dma,queues=1 \
+	    -kernel aertest -serial stdio -display none -no-reboot
+
 
 EXTRA_BUILT +=
-RUNTARGETS += run-iommutest run-p2ptest run-pritest
+RUNTARGETS += run-aertest run-iommutest run-p2ptest run-pritest
