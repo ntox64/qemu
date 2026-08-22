@@ -723,6 +723,16 @@ static void nvme_irq_assert(NvmeCtrl *n, NvmeCQueue *cq)
 
     if (cq->irq_enabled) {
         if (msix_enabled(pci)) {
+            /*
+             * hook: the Nth deliverable completion interrupt is
+             * lost one-shot (the CQ entry still lands); a driver that
+             * bounds its ISR wait and falls back to polling recovers.
+             * Re-armed on controller reset.
+             */
+            if (n->nto64_msix_drop_left > 0 &&
+                --n->nto64_msix_drop_left == 0) {
+                return;
+            }
             trace_pci_nvme_irq_msix(cq->vector);
             msix_notify(pci, cq->vector);
         } else {
@@ -8177,6 +8187,8 @@ static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst)
      * when its queue is deleted below.
      */
     n->nto64_stalled = false;
+    /* hook: re-arm the one-shot completion-interrupt drop. */
+    n->nto64_msix_drop_left = n->nto64_msix_drop;
 
     for (i = 1; i <= NVME_MAX_NAMESPACES; i++) {
         ns = nvme_ns(n, i);
@@ -9940,6 +9952,7 @@ static const Property nvme_props[] = {
     DEFINE_PROP_UINT32("nto64-wp-ms", NvmeCtrl, nto64_wp_ms, 0),
     DEFINE_PROP_UINT32("nto64-resv-conflict-ms", NvmeCtrl,
                        nto64_resv_conflict_ms, 0),
+    DEFINE_PROP_UINT32("nto64-msix-drop", NvmeCtrl, nto64_msix_drop, 0),
     DEFINE_PROP_BOOL("ctratt.mem", NvmeCtrl, params.ctratt.mem, false),
     DEFINE_PROP_BOOL("atomic.dn", NvmeCtrl, params.atomic_dn, 0),
     DEFINE_PROP_UINT16("atomic.awun", NvmeCtrl, params.atomic_awun, 0),

@@ -658,6 +658,8 @@ typedef struct NvmeCtrl {
     QEMUTimer   *nto64_resv_timer;      /* reservation-conflict window release */
     NvmeNamespace *nto64_resv_ns;       /* shared ns holding the armed reservation */
     uint32_t    nto64_resv_conflict_ms;
+    uint32_t    nto64_msix_drop;        /* drop the Nth completion interrupt */
+    uint32_t    nto64_msix_drop_left;
 
     struct {
         uint32_t acs[256];

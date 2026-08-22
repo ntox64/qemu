@@ -636,3 +636,16 @@ Run ``make run-nvmefault`` and the ``run-nvmeattach``, ``run-nvmedead``,
    head of an un-wiped ring can therefore not be returned as the status
    of the next command, which is what the revive and format-reset paths
    probe for with a planted entry before re-enabling the controller.
+
+NVMe lost completion interrupt
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``nvme,nto64-msix-drop=N`` suppresses the *N*th deliverable completion
+interrupt once and re-arms on reset.  Run ``make run-nvmeintr`` and
+``run-nvmeintrdrop``, which prove the submit, bounded interrupt wait, poll
+fallback and resume cycle on a controller that keeps completing commands.
+
+.. note::
+   The storage-side instance of the transport case above.  A controller
+   that stops posting completions at all is the dead-queue case, which is
+   a different test with a different recovery.
