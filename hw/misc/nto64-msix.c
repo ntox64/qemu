@@ -21,6 +21,9 @@
  *     0x10 trigger: write 1 -> fire the selected vector
  *     0x14 fire mask: write bits -> fire all set vectors (burst)
  *     0x18 per-vector fire counters, 4 bytes each (write 0 clears all)
+ *     0x60 spurious: write "SPR" (0x535052) -> fire the selected vector
+ *         IGNORING the enable bit (the device raises for something the
+ *         driver did not arm for); 0x64 = spurious count (write 0 clears)
  *   BAR1: MSI-X vector table (lower half) + PBA (upper half), set up
  *         by msix_init_exclusive_bar.
  *
@@ -47,6 +50,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Nto64MsixState, NTO64_MSIX)
 #define NTO64_MSIX_CTRL_SIZE 0x1000
 #define NTO64_MSIX_DEFAULT_VECTORS 4
 #define NTO64_MSIX_MAX_VECTORS 16
+#define NTO64_MSIX_SPURIOUS_MAGIC 0x535052u /* "SPR" */
 
 #define NTO64_MSIX_CTRL_ENABLE 0x1
 
@@ -57,6 +61,7 @@ typedef struct Nto64MsixState {
     uint32_t control;
     uint32_t count;
     uint32_t vector;
+    uint32_t spurious;         /* spurious-interrupt count (0x64) */
     uint32_t *pv;             /* per-vector fire counters */
 } Nto64MsixState;
 
@@ -93,6 +98,8 @@ static uint64_t nto64_msix_read(void *opaque, hwaddr addr, unsigned size)
         return s->vector;
     case 0x14:
         return 0;
+    case 0x64:
+        return s->spurious;
     default:
         if (addr >= 0x18 && addr < 0x18 + 4ULL * s->nv &&
             (addr & 3) == 0) {
@@ -136,6 +143,25 @@ static void nto64_msix_write(void *opaque, hwaddr addr,
         break;
     case 0x18:
         memset(s->pv, 0, sizeof(uint32_t) * s->nv);
+        break;
+    case 0x60:
+        /*
+         * Spurious: deliver on the selected vector even if the device
+         * is disabled - a "got an interrupt we didn't arm for" shape the
+         * driver must tolerate.  Uses the PBA/raising model: if the
+         * vector is masked, msix_notify sets the pending bit instead.
+         */
+        if (val == NTO64_MSIX_SPURIOUS_MAGIC) {
+            if (s->vector < s->nv) {
+                s->spurious++;
+                msix_notify(&s->pdev, s->vector);
+                info_report("nto64-msix: spurious vector %u (total %u)",
+                            s->vector, s->spurious);
+            }
+        }
+        break;
+    case 0x64:
+        s->spurious = 0;
         break;
     default:
         break;

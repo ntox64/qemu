@@ -204,6 +204,12 @@ scan_done:
     movl $1, %r12d            /* APIC ID */
 ap_loop:
     movl %r12d, %eax
+    shll $5, %eax
+    addl $0x9100, %eax
+    movl %eax, %r13d          /* AP slot */
+    movl $0, 0(%r13d)         /* clear ready flag (re-init handshake) */
+    movl $0, 4(%r13d)         /* and the id, so a stale value cannot pass */
+    movl %r12d, %eax
     shll $16, %eax
     addl $0x100000, %eax
     movl %eax, 0x9060         /* AP stack top */
@@ -212,7 +218,7 @@ ap_loop:
     movl $0xfee00310, %edx
     movl %eax, (%edx)         /* ICR2: dest APIC ID */
     movl $0xfee00300, %edx
-    movl $0x000c4500, (%edx)  /* INIT */
+    movl $0x00004500, (%edx)  /* INIT (targeted, physical dest) */
     movl $2000000, %ecx
 1:  decl %ecx
     jnz 1b
@@ -221,11 +227,7 @@ ap_loop:
     movl $0xfee00310, %edx
     movl %eax, (%edx)
     movl $0xfee00300, %edx
-    movl $0x000c4608, (%edx)  /* SIPI: vector 8 -> 0x8000 */
-    movl %r12d, %eax
-    shll $5, %eax
-    addl $0x9100, %eax
-    movl %eax, %r13d          /* AP slot */
+    movl $0x00004608, (%edx)  /* SIPI: vector 8 -> 0x8000 */
     movl $30000000, %ecx
 ap_wait:
     cmpl $0, 0(%r13d)
@@ -435,6 +437,75 @@ ap_done:
     movl %eax, pv2(%rip)
     movl 0x24(%esi), %eax
     movl %eax, pv3(%rip)
+
+    /* --- spurious: "SPR" raise on the selected vector, unmasked ----
+     * The device raises an interrupt the driver never armed for
+     * (BAR0+0x60 = "SPR", 0x535052; ignores the device enable bit).
+     * The per-CPU ISR still runs (vector 0x60 on APIC 0), but the
+     * device fire counters (0x08 total, 0x18 per-vector) must NOT
+     * move, and the spurious count (0x64) must advance.  A driver has
+     * to tolerate the unexpected delivery and keep its state
+     * consistent (the per-CPU handler count moving is the only side
+     * effect). */
+    movl msix_bar0(%rip), %esi
+    movl $0, 0x0c(%esi)          /* vector select = 0 */
+    movl 0x08(%esi), %eax
+    movl %eax, spr_devcnt0(%rip)
+    movl 0x18(%esi), %eax
+    movl %eax, spr_pv0_0(%rip)
+    movl $0x535052, 0x60(%esi)   /* SPR */
+    wait_msix 0x9100, 3
+    /* exactly APIC0 got it: 3/2/2/2, masks 1/2/4/8 */
+    chk_msix 0x9100, 1, 3
+    chk_msix 0x9120, 2, 2
+    chk_msix 0x9140, 4, 2
+    chk_msix 0x9160, 8, 2
+    /* device: no fire counted, spurious count = 1 */
+    movl 0x08(%esi), %eax
+    cmpl spr_devcnt0(%rip), %eax
+    jne 1f
+    movl 0x18(%esi), %eax
+    cmpl spr_pv0_0(%rip), %eax
+    jne 1f
+    movl 0x64(%esi), %eax
+    cmpl $1, %eax
+    je 2f
+1:  incl fail(%rip)
+2:
+
+    /* --- spurious while the vector is MASKED: msix_notify sets the
+     * PBA pending bit instead of delivering; the ISR must NOT run
+     * until the driver unmaskes the vector, which then delivers the
+     * pending raise.  Device fire counters still don't move. ---- */
+    movl %r14d, %ecx
+    movl $1, 12(%ecx)            /* vector control[0].mask = 1 */
+    movl $0x535052, 0x60(%esi)   /* SPR while masked */
+    movl $2000000, %ecx
+3:  decl %ecx
+    jnz 3b
+    chk_msix 0x9100, 1, 3        /* nothing delivered while masked */
+    movl 0x64(%esi), %eax
+    cmpl $2, %eax
+    je 4f
+    incl fail(%rip)
+4:  movl %r14d, %ecx
+    movl $0, 12(%ecx)            /* unmask -> pending delivered */
+    wait_msix 0x9100, 4
+    chk_msix 0x9100, 1, 4
+    chk_msix 0x9120, 2, 2
+    chk_msix 0x9140, 4, 2
+    chk_msix 0x9160, 8, 2
+    movl 0x08(%esi), %eax
+    cmpl spr_devcnt0(%rip), %eax
+    jne 5f
+    movl 0x18(%esi), %eax
+    cmpl spr_pv0_0(%rip), %eax
+    jne 5f
+    movl 0x64(%esi), %eax
+    cmpl $2, %eax
+    je 6f
+5:  incl fail(%rip)
+6:  movl $1, spr_done(%rip)
 
     /* --- DMA: nto64-dma bound to node 0 ----
      * local DMA within node0's window page (direct RAM), then
@@ -941,6 +1012,10 @@ pq_next:
     call puts
     movl negdrop(%rip), %eax
     call puthex
+    lea sp_spr(%rip), %rsi
+    call puts
+    movl spr_done(%rip), %eax
+    call puthex
     lea sp_dev(%rip), %rsi
     call puts
     movl devcnt_final(%rip), %eax
@@ -1103,8 +1178,9 @@ ap_main:
     addl $0x9100, %eax
     movl %eax, %r13d          /* slot: [0]=ready [4]=id [8]=msix mask
                                  [0xc]=msix cnt [0x10]=msi cnt */
-    movl $1, 0(%r13d)
-    movl %r12d, 4(%r13d)
+    movl %r12d, 4(%r13d)      /* write the result first ... */
+    movl $1, 0(%r13d)         /* ... publish ready last, so the BSP
+                                 never sees ready before the id is set */
 1:  hlt
     jmp 1b
 
@@ -1368,6 +1444,9 @@ pv0:        .long 0
 pv1:        .long 0
 pv2:        .long 0
 pv3:        .long 0
+spr_devcnt0: .long 0
+spr_pv0_0:  .long 0
+spr_done:   .long 0
 dma_dev:    .long 0
 dma_bar0:   .long 0
 dma_bar1:   .long 0
@@ -1398,6 +1477,7 @@ sp_m1:      .asciz " m1="
 sp_m2:      .asciz " m2="
 sp_m3:      .asciz " m3="
 sp_neg:     .asciz " neg="
+sp_spr:     .asciz " spr="
 sp_dev:     .asciz " dev="
 sp_pv:      .asciz " pv="
 sp_dma:     .asciz " dma="

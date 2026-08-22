@@ -12,6 +12,20 @@ run-irqtest: irqtest
 msix-fat.img: BOOTX64-msix.EFI fatimg.py
 	python3 fatimg.py BOOTX64-msix.EFI $@
 
+msixtest.bin: msixtest.S $(BUILD_DEPS)
+	gcc -m64 -nostdlib -ffreestanding -fno-pie -mno-red-zone \
+	    -Wl,-Ttext=0x1000 -Wl,--oformat=binary -o $@ $<
 
-EXTRA_BUILT += msix-fat.img
-RUNTARGETS += run-irqtest
+BOOTX64-msix.EFI: msixtest.bin pewrap.py
+	python3 pewrap.py msixtest.bin $@
+
+run-msixtest: msix-fat.img /tmp/ovmf-nto64.fd
+	$(QEMU) -machine pc,nto64-per-cpu-ram=on -smp 4 -m 512 \
+	    -device nto64-irqgen -device nto64-msix -device nto64-dma \
+	    -drive file=msix-fat.img,format=raw,if=ide \
+	    -drive if=pflash,format=raw,unit=0,file=/tmp/ovmf-nto64.fd,readonly=on \
+	    -serial stdio -display none -no-reboot
+
+
+EXTRA_BUILT += BOOTX64-msix.EFI msix-fat.img msixtest.bin
+RUNTARGETS += run-irqtest run-msixtest

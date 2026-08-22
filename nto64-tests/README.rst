@@ -321,3 +321,22 @@ half.  Run ``make run-msixtest`` for the completion and locality checks.
    last entry is not valid completes with an error, because a test device
    that quietly succeeds hides precisely the driver bugs this tree exists
    to find.
+
+
+Spurious raises and the masked-vector path
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Writing the ``SPR`` magic to ``nto64-msix`` BAR0 offset ``0x60`` raises
+the selected vector ignoring the device enable bit, and leaves it pending
+in the PBA when the vector is masked.  The fire counters do not move; a
+separate spurious counter at ``0x64`` does.  This is part of
+``make run-msixtest``: an unmasked raise advances exactly the targeted
+APIC's handler count, a masked one arrives at unmask, and neither changes
+what the device claims to have sent.
+
+.. note::
+   Only one unexpected-delivery shape is modelled - a raise with no
+   doorbell behind it.  A device that raises the *wrong* vector number is a
+   different fault and is not produced here.  This case shares the
+   ``msixtest`` harness with the DMA completion phases below, so it lands
+   just after them.
