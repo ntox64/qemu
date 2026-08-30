@@ -56,9 +56,11 @@ static void initialize_debug_host(CPUDebug *s)
     s->info.cap_mode = CS_MODE_64;
     s->info.cap_insn_unit = 1;
     s->info.cap_insn_split = 8;
-#elif defined(_ARCH_PPC64)
+#elif defined(_ARCH_PPC)
     s->info.cap_arch = CS_ARCH_PPC;
+# ifdef _ARCH_PPC64
     s->info.cap_mode = CS_MODE_64;
+# endif
 #elif defined(__riscv)
 #if defined(_ILP32) || (__riscv_xlen == 32)
     s->info.print_insn = print_insn_riscv32;

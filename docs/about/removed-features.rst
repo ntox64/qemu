@@ -896,11 +896,6 @@ work around the atomicity issues in system mode by running all vCPUs
 in a single thread context; in user mode atomicity was simply broken.
 From 10.0, QEMU has disabled configuration of 64-bit guests on 32-bit hosts.
 
-32-bit PPC (since 10.2)
-'''''''''''''''''''''''
-
-The QEMU project no longer supports 32-bit host builds.
-
 Guest Emulator ISAs
 -------------------
 
