@@ -509,6 +509,40 @@ void gdb_handle_set_qemu_phy_mem_mode(GArray *params, void *ctx)
     gdb_put_packet("OK");
 }
 
+void gdb_handle_query_qemu_cr3(GArray *params, void *ctx)
+{
+    uint64_t cr3 = 0;
+
+    if (gdbserver_state.g_cpu) {
+        cr3 = gdbserver_state.g_cpu->debug_cr3;
+    }
+    g_string_printf(gdbserver_state.str_buf, "0x%" PRIx64, cr3);
+    gdb_put_strbuf();
+}
+
+void gdb_handle_set_qemu_cr3(GArray *params, void *ctx)
+{
+    uint64_t cr3;
+    CPUState *cpu;
+
+    if (!params->len) {
+        gdb_put_packet("E22");
+        return;
+    }
+
+    cr3 = gdb_get_cmd_param(params, 0)->val_ul;
+    /*
+     * Apply to every vCPU.  The override is a page-table root, not per-CPU
+     * mutable state, and the gdbstub may insert a software breakpoint via
+     * c_cpu while reading via g_cpu; publishing it on all vCPUs makes either
+     * path resolve through the advertised address space.
+     */
+    CPU_FOREACH(cpu) {
+        cpu->debug_cr3 = cr3;
+    }
+    gdb_put_packet("OK");
+}
+
 void gdb_handle_query_rcmd(GArray *params, void *ctx)
 {
     const guint8 zero = 0;

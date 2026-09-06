@@ -570,6 +570,15 @@ struct CPUState {
     uint32_t halted;
     int32_t exception_index;
 
+    /*
+     * Override for the debug virtual->physical translation root (e.g. an x86
+     * CR3, or an aarch64 TTBR0).  When non-zero, memory accesses performed by
+     * the gdbstub / monitor use this page-table root instead of the CPU's live
+     * one, so a debugger can inspect a process address space that is not
+     * currently active on this vCPU.  Zero means "use the live root".
+     */
+    uint64_t debug_cr3;
+
     bool vcpu_dirty;
     AccelCPUState *accel;
 

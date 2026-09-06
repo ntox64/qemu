@@ -10,6 +10,8 @@
 !*.c
 !*.py
 !*.mk
+!*.gdb
+!*.inc
 !*.rst
 !*.conf
 !Makefile

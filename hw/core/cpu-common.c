@@ -308,6 +308,7 @@ static void cpu_common_initfn(Object *obj)
 
     cpu->cpu_index = UNASSIGNED_CPU_INDEX;
     cpu->cluster_index = UNASSIGNED_CLUSTER_INDEX;
+    cpu->debug_cr3 = 0;
     cpu->as = NULL;
     cpu->num_ases = 0;
     /* user-mode doesn't have configurable SMP topology */

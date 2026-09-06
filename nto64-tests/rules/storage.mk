@@ -3,7 +3,7 @@
 # storage.mk -- one subsystem of the testbed;
 # README.rst says what each run target proves.
 
-vblktest: vblktest.S
+vblktest: vblktest.S $(BUILD_DEPS) nto64-expect.inc
 	# --build-id=none: see the numatest comment (multiboot span trap).
 	gcc -m32 -nostdlib -static -fno-pie \
 	    -Wl,--build-id=none \
@@ -64,7 +64,7 @@ run-vblkringfull: vblktest vblk-clean.conf
 	    -device virtio-blk-pci,ioeventfd=off,drive=drive0,queue-size=8 \
 	    -kernel vblktest -append 'NTO64EXP=20' -serial stdio -display none -no-reboot
 
-scsitest: scsitest.S
+scsitest: scsitest.S $(BUILD_DEPS) nto64-expect.inc
 	# --build-id=none: see the numatest comment (multiboot span trap).
 	gcc -m32 -nostdlib -static -fno-pie \
 	    -Wl,--build-id=none \
@@ -85,7 +85,7 @@ run-scsitest: scsitest scsi-clean.conf
 	    $(SCSI_DEV) $(SCSI_HD) \
 	    -kernel scsitest -append 'NTO64EXP=11121111121' -serial stdio -display none -no-reboot
 
-scsiintr: scsiintr.S
+scsiintr: scsiintr.S $(BUILD_DEPS) nto64-expect.inc
 	# --build-id=none: see the numatest comment (multiboot span trap).
 	gcc -m32 -nostdlib -static -fno-pie \
 	    -Wl,--build-id=none \
@@ -152,7 +152,7 @@ run-scsiwp: scsitest scsi-clean.conf
 
 # polling fallback (nto64-msix-drop on qemu-xhci) ----
 
-ahcitest: ahcitest.S
+ahcitest: ahcitest.S $(BUILD_DEPS) nto64-expect.inc
 	# --build-id=none: see the numatest comment (multiboot span trap).
 	gcc -m32 -nostdlib -static -fno-pie \
 	    -Wl,--build-id=none \
@@ -170,13 +170,13 @@ SATA_DEV = -device ide-hd,drive=drive0,bus=ide.0
 
 run-satatest: ahcitest sata-clean.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-clean.conf) \
 	    $(SATA_DEV) \
 	    -kernel ahcitest -append 'NTO64EXP=11111000000000' \
 	    -serial stdio -display none -no-reboot
 
-ahciintr: ahciintr.S
+ahciintr: ahciintr.S $(BUILD_DEPS) nto64-expect.inc
 	# --build-id=none: see the numatest comment (multiboot span trap).
 	gcc -m32 -nostdlib -static -fno-pie \
 	    -Wl,--build-id=none \
@@ -185,7 +185,7 @@ ahciintr: ahciintr.S
 
 run-ahciintr: ahciintr sata-clean.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-clean.conf) \
 	    $(SATA_DEV) \
 	    -kernel ahciintr -append 'NTO64EXP=0' \
@@ -193,7 +193,7 @@ run-ahciintr: ahciintr sata-clean.conf
 
 run-ahciintrdrop: ahciintr sata-clean.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -global ich9-ahci.nto64-msi-drop=2 \
 	    -drive $(call SATA_DRIVE,sata-clean.conf) \
 	    $(SATA_DEV) \
@@ -202,7 +202,7 @@ run-ahciintrdrop: ahciintr sata-clean.conf
 
 run-satabadtrack: ahcitest sata-badtrack.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-badtrack.conf) \
 	    $(SATA_DEV) \
 	    -kernel ahcitest -append 'NTO64EXP=21111000000000' \
@@ -210,7 +210,7 @@ run-satabadtrack: ahcitest sata-badtrack.conf
 
 run-sataerr: ahcitest sata-err.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-err.conf) \
 	    $(SATA_DEV) \
 	    -kernel ahcitest -append 'NTO64EXP=12221000000000' \
@@ -218,7 +218,7 @@ run-sataerr: ahcitest sata-err.conf
 
 run-satapersist: ahcitest sata-persist.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-persist.conf) \
 	    $(SATA_DEV) \
 	    -kernel ahcitest -append 'NTO64EXP=11113100000000' \
@@ -226,7 +226,7 @@ run-satapersist: ahcitest sata-persist.conf
 
 run-sataslow: ahcitest sata-slow.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-slow.conf) \
 	    $(SATA_DEV) \
 	    -kernel ahcitest -append 'NTO64EXP=11111011000000' \
@@ -234,7 +234,7 @@ run-sataslow: ahcitest sata-slow.conf
 
 run-satastuck: ahcitest sata-clean.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-clean.conf) \
 	    -device ide-hd,drive=drive0,bus=ide.0,nto64-stuck-sector=7168 \
 	    -kernel ahcitest -append 'NTO64EXP=11111000110000' \
@@ -244,7 +244,7 @@ run-satastuck: ahcitest sata-clean.conf
 
 run-satancq: ahcitest sata-ncq.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-ncq.conf) \
 	    $(SATA_DEV) \
 	    -kernel ahcitest -append 'NTO64EXP=11111000000100' \
@@ -252,7 +252,7 @@ run-satancq: ahcitest sata-ncq.conf
 
 run-satasdblie: ahcitest sata-clean.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-clean.conf) \
 	    -device ide-hd,drive=drive0,bus=ide.0,nto64-sdb-lie-tag=0 \
 	    -kernel ahcitest -append 'NTO64EXP=11111000000010' \
@@ -260,7 +260,7 @@ run-satasdblie: ahcitest sata-clean.conf
 
 run-satad2hlie: ahcitest sata-clean.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-clean.conf) \
 	    -device ide-hd,drive=drive0,bus=ide.0,nto64-d2h-lie-sector=0x1e10 \
 	    -kernel ahcitest -append 'NTO64EXP=11111000000003' \
@@ -268,13 +268,13 @@ run-satad2hlie: ahcitest sata-clean.conf
 
 run-satad2hlie2: ahcitest sata-d2hlie.conf
 	truncate -s 4M $(SATA_IMG)
-	$(QEMU) -machine q35 -m 64 \
+	$(QEMU) -machine q35 -device isa-serial -m 64 \
 	    -drive $(call SATA_DRIVE,sata-d2hlie.conf) \
 	    -device ide-hd,drive=drive0,bus=ide.0,nto64-d2h-lie-sector=0x1e10 \
 	    -kernel ahcitest -append 'NTO64EXP=11111000000003' \
 	    -serial stdio -display none -no-reboot
 
-nvmetest: nvmetest.S
+nvmetest: nvmetest.S $(BUILD_DEPS)
 	# --build-id=none: see the numatest comment (multiboot span trap).
 	gcc -m32 -nostdlib -static -fno-pie \
 	    -Wl,--build-id=none \
@@ -283,13 +283,13 @@ nvmetest: nvmetest.S
 
 run-nvmetest: nvmetest
 	truncate -s 64M /tmp/nvme-test.img
-	$(QEMU) -machine q35,nto64-per-cpu-ram=on -smp 2 -m 128 \
+	$(QEMU) -machine q35,nto64-per-cpu-ram=on -device isa-serial -smp 2 -m 128 \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6 \
 	    -drive file=/tmp/nvme-test.img,if=none,id=drv0,format=raw \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
 	    -kernel nvmetest -serial stdio -display none -no-reboot
 
-nvmefault: nvmefault.S
+nvmefault: nvmefault.S $(BUILD_DEPS) nto64-expect.inc
 	# --build-id=none: see the numatest comment (multiboot span trap).
 	gcc -m32 -nostdlib -static -fno-pie \
 	    -Wl,--build-id=none \
@@ -306,7 +306,7 @@ NVME_F_DEV = -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto6
 
 run-nvmefault: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    $(NVME_F_DEV) \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -314,7 +314,7 @@ run-nvmefault: nvmefault nvme-cold.conf
 
 run-nvmestuck: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-stuck-lba=45056 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -322,7 +322,7 @@ run-nvmestuck: nvmefault nvme-cold.conf
 
 run-nvmeattach: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-start-fail=2 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -330,7 +330,7 @@ run-nvmeattach: nvmefault nvme-cold.conf
 
 run-nvmedead: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-start-fail=10 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -338,7 +338,7 @@ run-nvmedead: nvmefault nvme-cold.conf
 
 run-nvmehang: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-start-fail=2,nto64-hang-start=3 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -346,7 +346,7 @@ run-nvmehang: nvmefault nvme-cold.conf
 
 run-nvmelate: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-late-attach-ms=2000 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -354,7 +354,7 @@ run-nvmelate: nvmefault nvme-cold.conf
 
 run-nvmereplug: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-replug-ms=3000 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -364,7 +364,7 @@ run-nvmereplug: nvmefault nvme-cold.conf
 
 run-nvmerdylie: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-rdy-lie-start=1 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -372,7 +372,7 @@ run-nvmerdylie: nvmefault nvme-cold.conf
 
 run-nvmedmarev: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-stall-lba=0xc000 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -380,7 +380,7 @@ run-nvmedmarev: nvmefault nvme-cold.conf
 
 run-nvmedeadq: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-dead-cq=2 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -394,7 +394,7 @@ run-nvmedeadq: nvmefault nvme-cold.conf
 
 run-nvmeaer: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    $(NVME_F_DEV) \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -402,7 +402,7 @@ run-nvmeaer: nvmefault nvme-cold.conf
 
 run-nvmenotready: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-ns-not-ready-ms=100 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -414,15 +414,15 @@ run-nvmenotready: nvmefault nvme-cold.conf
 #: the probe into a clean-format run that fails the expectation.
 run-nvmeformatstall: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-format-stall-ms=2000 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
-	    -kernel nvmefault -append 'NTO64EXP=0' -serial stdio -display none -no-reboot
+	    -kernel nvmefault -append 'NTO64EXP=20000' -serial stdio -display none -no-reboot
 
 run-nvmeformatreset: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-format-stall-ms=2000 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -430,7 +430,7 @@ run-nvmeformatreset: nvmefault nvme-cold.conf
 
 run-nvmewp: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-wp-ms=100 \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
@@ -444,7 +444,7 @@ run-nvmewp: nvmefault nvme-cold.conf
 
 run-nvmeresv: nvmefault nvme-cold.conf
 	truncate -s 64M $(NVME_F_IMG)
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -drive $(call NVME_F_DRIVE,nvme-cold.conf) \
 	    -device nvme-subsys,id=subsys0 \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=4,msix_qsize=6,nto64-link-gen=3,nto64-resv-conflict-ms=100,subsys=subsys0 \
@@ -452,7 +452,7 @@ run-nvmeresv: nvmefault nvme-cold.conf
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0,shared=on \
 	    -kernel nvmefault -append 'NTO64EXP=18000' -serial stdio -display none -no-reboot
 
-nvmeintr: nvmeintr.S
+nvmeintr: nvmeintr.S $(BUILD_DEPS)
 	# --build-id=none: see the numatest comment (multiboot span trap).
 	gcc -m32 -nostdlib -static -fno-pie \
 	    -Wl,--build-id=none \
@@ -461,13 +461,13 @@ nvmeintr: nvmeintr.S
 
 run-nvmeintr: nvmeintr
 	truncate -s 64M /tmp/nvme-intr.img
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=2,msix_qsize=4 \
 	    -drive file=/tmp/nvme-intr.img,if=none,id=drv0,format=raw \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \
 	    -kernel nvmeintr -serial stdio -display none -no-reboot
 
-nvmeintr-drop: nvmeintr.S
+nvmeintr-drop: nvmeintr.S $(BUILD_DEPS)
 	# clean vs drop are the same guest source; the build flag teaches the
 	# guest which path to expect so a lost-interrupt feature failure is a
 	# real `f=...' failure instead of a silent a2=1 pass.
@@ -479,7 +479,7 @@ nvmeintr-drop: nvmeintr.S
 
 run-nvmeintrdrop: nvmeintr-drop
 	truncate -s 64M /tmp/nvme-intr.img
-	$(QEMU) -machine q35 -smp 1 -m 128 \
+	$(QEMU) -machine q35 -device isa-serial -smp 1 -m 128 \
 	    -device nvme,serial=nvme0,id=nvme0,max_ioqpairs=2,msix_qsize=4,nto64-msix-drop=4 \
 	    -drive file=/tmp/nvme-intr.img,if=none,id=drv0,format=raw \
 	    -device nvme-ns,drive=drv0,nsid=1,bus=nvme0 \

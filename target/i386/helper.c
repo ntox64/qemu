@@ -245,6 +245,7 @@ hwaddr x86_cpu_get_phys_page_attrs_debug(CPUState *cs, vaddr addr,
 {
     X86CPU *cpu = X86_CPU(cs);
     CPUX86State *env = &cpu->env;
+    hwaddr cr3;
     target_ulong pde_addr, pte_addr;
     uint64_t pte;
     int32_t a20_mask;
@@ -252,6 +253,12 @@ hwaddr x86_cpu_get_phys_page_attrs_debug(CPUState *cs, vaddr addr,
     int page_size;
 
     *attrs = cpu_get_mem_attrs(env);
+
+    /* The debug visitor may target a process page table that is not the one
+     * currently active on this vCPU (e.g. the compat 32-bit process AS while
+     * the vCPU is sitting in the 64-bit kernel).  A non-zero debug_cr3 wins
+     * over env->cr[3] so the walk below resolves through that address space. */
+    cr3 = cs->debug_cr3 ? cs->debug_cr3 : env->cr[3];
 
     a20_mask = x86_get_a20_mask(env);
     if (!(env->cr[0] & CR0_PG_MASK)) {
@@ -275,14 +282,14 @@ hwaddr x86_cpu_get_phys_page_attrs_debug(CPUState *cs, vaddr addr,
             }
 
             if (la57) {
-                pml5e_addr = ((env->cr[3] & ~0xfff) +
+                pml5e_addr = ((cr3 & ~0xfff) +
                         (((addr >> 48) & 0x1ff) << 3)) & a20_mask;
                 pml5e = x86_ldq_phys(cs, pml5e_addr);
                 if (!(pml5e & PG_PRESENT_MASK)) {
                     return -1;
                 }
             } else {
-                pml5e = env->cr[3];
+                pml5e = cr3;
             }
 
             pml4e_addr = ((pml5e & PG_ADDRESS_MASK) +
@@ -306,7 +313,7 @@ hwaddr x86_cpu_get_phys_page_attrs_debug(CPUState *cs, vaddr addr,
         } else
 #endif
         {
-            pdpe_addr = ((env->cr[3] & ~0x1f) + ((addr >> 27) & 0x18)) &
+            pdpe_addr = ((cr3 & ~0x1f) + ((addr >> 27) & 0x18)) &
                 a20_mask;
             pdpe = x86_ldq_phys(cs, pdpe_addr);
             if (!(pdpe & PG_PRESENT_MASK))
@@ -337,7 +344,7 @@ hwaddr x86_cpu_get_phys_page_attrs_debug(CPUState *cs, vaddr addr,
         uint32_t pde;
 
         /* page directory entry */
-        pde_addr = ((env->cr[3] & ~0xfff) + ((addr >> 20) & 0xffc)) & a20_mask;
+        pde_addr = ((cr3 & ~0xfff) + ((addr >> 20) & 0xffc)) & a20_mask;
         pde = x86_ldl_phys(cs, pde_addr);
         if (!(pde & PG_PRESENT_MASK))
             return -1;

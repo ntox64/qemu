@@ -35,10 +35,13 @@ Test shape
 ~~~~~~~~~~
 
 One assembly source per case: a multiboot header at ``0x100000``, code at
-``0x101000``, no libc, and exactly one distinctive ``... VERIFIED`` line
-written to COM1 before the guest faults.  A passing test therefore prints
-its line and a failing one prints nothing, so the whole matrix is a grep
-and no host-side framework sits between a run and its result.
+``0x101000``, no libc.  Each guest writes one distinctive result line to
+COM1 -- an ``OK`` marker plus (for most cases) an ``f=``/``fail=`` field
+that is zero on success -- and then stops (typically a ``cli; hlt`` loop,
+a triple fault, or a UEFI exit).  A passing case therefore prints its
+line with a zero fail field; a failing one prints a non-zero ``f=``, or
+nothing at all if it dies before the report.  The matrix is a grep of
+the fail field, with no host-side framework between a run and its result.
 
 Cases that need firmware are linked as binaries, wrapped as ``PE32+`` by
 ``pewrap.py``, placed on a FAT16 image by ``fatimg.py`` and booted
@@ -49,7 +52,10 @@ through OVMF.
    64 KiB aligned; it is only loaded as pflash.  Likewise the guests are
    linked with no build-id note: the default note becomes a sparse high
    ``PT_LOAD`` and the multiboot loader writes its whole span over RAM,
-   which erases the ACPI tables.
+   which erases the ACPI tables.  ``q35`` does not map a default ISA COM1,
+   so every ``-machine q35`` run target adds ``-device isa-serial``; the
+   ``pc`` cases already get one.  Without the serial device a guest's COM1
+   poll loops forever and the run appears to hang.
 
 Run targets are grouped per subsystem under ``rules/``, one makefile per
 section below.  ``clean`` and ``.PHONY`` derive from the sources, so
@@ -637,6 +643,7 @@ Run ``make run-nvmefault`` and the ``run-nvmeattach``, ``run-nvmedead``,
    of the next command, which is what the revive and format-reset paths
    probe for with a planted entry before re-enabling the controller.
 
+
 NVMe lost completion interrupt
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -804,6 +811,33 @@ Run ``make run-netfault``, ``run-netrxdrop``, ``run-nettxstall``,
    absolute deadline appears only in a stream that has a window to carry.
    ``post_load`` re-arms the timer from it, so a destination cannot
    inherit a link that is down with nothing left to bring it back up.
+
+
+gdbstub: compat (32-bit) address-space breakpoints
+--------------------------------------------------
+
+``compatas`` is a positive control for the tree's gdbstub debug-CR3
+override (the ``Qqemu.Cr3:<cr3>`` inspection command, ``qemu.Cr3``).  It
+builds a single multiboot kernel that enters long mode, sets up two page
+table roots (a kernel root that maps only the kernel, and a user root that
+also maps a 2 MiB page at ``0x1800000``), copies an embedded 32-bit compat
+program into that page and ``iretq``-es into it at ring 3.  The compat
+program prints ``COMPATAS-ENTER`` and spins at ``0x1800020``.
+
+Why two roots: the compat user VA is deliberately *absent* from the kernel
+root, so with the vCPU in the kernel a debug read of ``0x1800020`` gives
+``Cannot access memory`` - exactly the limitation ``qemu.Cr3`` exists to
+lift.  The run target drives gdb over TCG and proves the whole arc: the
+read fails without the override, the same read succeeds after
+``Qqemu.Cr3:0x303000``, and a software breakpoint set on ``*0x1800020``
+then fires in the 32-bit user code.
+
+Run ``make run-compatas`` for the plain serial boot (two markers, then
+spin) and ``make run-compatas-gdb`` for the gdb drive (requires
+``gdb-multiarch``).  The gdb run must use ``-accel tcg,one-insn-per-tb=on``
+and ``-S``; see WORKFLOW "TCG gdb determinism".  This is a debugger-control
+test, not a device test: it proves the *break* mechanism, and does not
+model any device or bus behaviour.
 
 
 What this tree cannot model
