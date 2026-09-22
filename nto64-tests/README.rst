@@ -840,6 +840,51 @@ test, not a device test: it proves the *break* mechanism, and does not
 model any device or bus behaviour.
 
 
+TCG plugin: guarded field sets under their lock
+-----------------------------------------------
+
+``plugins/hbguard.c`` is a TCG plugin (``make guard`` builds
+``plugins/hbguard.so``) for a class of invariant that no guest-visible
+check can settle: "every access to this field set happens under that
+lock, and no two vCPUs touch one of its words without a lock-mediated
+edge between them".  The window that breaks it is a few instructions
+wide and a debugger stops the world that contains it, so the plugin runs
+inside the TCG translation path instead: it hooks the memory accesses of
+the instructions in a chosen code range, follows each lock word's stores
+to see acquire (free -> 1) and release (held -> 0), and reports
+
+ * ``HBGUARD-UNGUARDED`` - a store to a watched field by a vCPU that does
+   not hold the field's lock at that moment;
+ * ``HBGUARD-RACE`` - two accesses to one watched word from two vCPUs, at
+   least one a store, with no release of that field's lock between them.
+
+It exists because four hardware watchpoints per vCPU - one object at a
+time - is a small budget, and because a per-access callback in the
+translation path neither stops the guest nor perturbs the interleaving it
+measures.  A run ends with one ``HBGUARD-LOCK`` line per lock (acquires,
+releases, and the stores that were neither: counted, never guessed at)
+and one ``HBGUARD-FIELD`` line per field, which states the number of
+accesses it actually saw; a field with zero accesses is reported
+``measured=NO-MEASUREMENT`` and never as a clean one.
+
+Addresses are the object here.  Arm a field and a lock that live at fixed
+addresses (static kernel objects), so the same address denotes the same
+object in every boot of that build; a heap object (a per-process record)
+cannot be named before the guest has run, and a remembered address from
+an earlier boot would name whatever lives there now.  A negative control
+belongs to a run rather than to an extra one: arm one field that is NOT
+written under the lock claimed for it and require the run to report it,
+because an instrument that cannot fail is not a check.
+
+What it cannot do: it sees only accesses from the hooked code range (a
+store outside it is not measured, and the summary prints the range); it
+reads a lock word as a bare 0/1 word, so it neither understands a lock
+with more states nor follows a per-object lock chosen at run time; and it
+reports a candidate, not a verdict - the field's own invariant decides
+whether a named access belongs under the lock.  The runs and their
+verdicts live with the consumer's own tooling, not in this tree.
+
+
 What this tree cannot model
 ---------------------------
 
