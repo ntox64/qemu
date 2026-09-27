@@ -884,6 +884,65 @@ reports a candidate, not a verdict - the field's own invariant decides
 whether a named access belongs under the lock.  The runs and their
 verdicts live with the consumer's own tooling, not in this tree.
 
+TCG plugin: one slot's writers, without stopping the world
+----------------------------------------------------------
+
+``plugins/slotwatch.c`` (``make slotwatch`` builds ``plugins/slotwatch.so``)
+answers a narrower question than hbguard's and one a debugger cannot: "what
+stored THIS 4-byte value, and from which instruction?"  A hardware watchpoint
+needs the guest stopped, and the faults worth watching this way are
+concurrency windows that stopping DELETES - measured on the kernel under test,
+40 of 40 debugger-watched boots were clean where free-running boots failed
+about one time in six.  So the watch lives in the TCG translation path: it
+hooks every STORE of the instructions in the chosen code ranges and reports
+the ones that land on the slot.
+
+::
+
+    -plugin file=plugins/slotwatch.so,\
+            slot=0x0a02ee08,\
+            code=0x0a000000:0x0a00a700,\
+            code=0xffffffff8014d7f0:0xffffffff8014dba0,\
+            budget=24,codestore=0x0a000000:0x0a00a700,callpush=1
+
+ * ``slot=VA`` - the 4-byte slot.
+ * ``code=LO:HI`` - instrument the stores of those instructions only;
+   repeatable.  No ``code=`` means every instruction (very slow).
+ * ``codestore=LO:HI`` - ALSO report stores whose VALUE is a code address,
+   excluding ``call`` pushes (a pushed return address is exactly ``pc+size``,
+   and they are the bulk of such stores).  This is what turns "the slot took a
+   code address" into "the instruction that put it there".
+ * ``callpush=1`` - keep a 64-entry ring of call pushes and DUMP it when an
+   event fires: a call trail at the moment of interest.
+ * ``budget=N`` - printed hits per class before suppression (the suppressed
+   count is reported).
+ * ``frame=PHYS`` and ``frameoff=OFF`` - watch a physical frame directly
+   rather than waiting to learn it from the owner's first VA store.
+   ``frameoff=`` requires ``frame=`` and defaults to the slot's page offset.
+ * ``frameany=1`` - watch every offset in ``frame=``; conflicts with an
+   explicit ``frameoff=``.
+ * ``physlo=LO`` and ``physhi=HI`` - watch a physical range.  Both are
+   required, and ``LO`` must be below ``HI``.
+
+The slot is matched on its VIRTUAL ADDRESS **and on the physical frame that
+address maps to** (learned from the owner's own first write), because a kernel
+writer reaches the same bytes through its per-CPU copy window - a different
+virtual address, the same frame - and only the physical comparison catches
+that.  Each line names the writing instruction, the vCPU, the address, the
+value, the size and whether the writer was kernel or user code; the summary
+reports ``measured=NO-MEASUREMENT`` when it hooked nothing or saw no store,
+and never a clean bill of health.  The summary distinguishes ``armed=yes``,
+``stores_observed=yes|no`` and ``target_hits=N`` so a run that observed other
+stores but never reached the selected target cannot look like a successful
+measurement.
+
+What it cannot do: it sees only stores from the hooked code ranges (a writer
+outside them is not measured, and the summary prints what was hooked); it
+reports the VALUE it saw, not the register that held it, so it names the
+instruction that stored a bad value rather than the instruction that computed
+it; and it is per-run tooling - the slot, its address and the code ranges must
+be derived from the image's own symbols for each consumer build.
+
 
 What this tree cannot model
 ---------------------------
